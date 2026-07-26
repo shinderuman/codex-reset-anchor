@@ -473,6 +473,7 @@ func runAnchor(ctx context.Context, cfg config) error {
 	args := []string{
 		"exec",
 		"--ephemeral",
+		"--skip-git-repo-check",
 		"--sandbox", "read-only",
 		"--ask-for-approval", "never",
 	}
