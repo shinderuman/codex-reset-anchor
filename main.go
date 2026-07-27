@@ -20,11 +20,12 @@ import (
 )
 
 const (
-	clientName              = "codex-reset-anchor"
-	clientTitle             = "Codex Reset Anchor"
-	clientVersion           = "0.1.0"
-	minimumUsageDropPercent = 5.0
-	minimumWeeklyWindow     = 24 * time.Hour
+	clientName                        = "codex-reset-anchor"
+	clientTitle                       = "Codex Reset Anchor"
+	clientVersion                     = "0.1.0"
+	limitResetThresholdPercent        = 1.0
+	resetBoundaryEquivalenceTolerance = 2 * time.Minute
+	minimumWeeklyWindow               = 24 * time.Hour
 )
 
 type config struct {
@@ -71,13 +72,19 @@ type rateLimitsUpdatedParams struct {
 	RateLimits rateLimitBucket `json:"rateLimits"`
 }
 
+type resetDetectorState struct {
+	WasAboveThreshold bool  `json:"wasAboveThreshold"`
+	ResetBoundary     int64 `json:"resetBoundary"`
+}
+
 type quotaState struct {
-	LimitID           string  `json:"limitId"`
-	WindowName        string  `json:"windowName"`
-	UsedPercent       float64 `json:"usedPercent"`
-	WindowDurationMin int64   `json:"windowDurationMins"`
-	ResetsAt          int64   `json:"resetsAt"`
-	CheckedAt         int64   `json:"checkedAt"`
+	LimitID           string              `json:"limitId"`
+	WindowName        string              `json:"windowName"`
+	UsedPercent       float64             `json:"usedPercent"`
+	WindowDurationMin int64               `json:"windowDurationMins"`
+	ResetsAt          int64               `json:"resetsAt"`
+	CheckedAt         int64               `json:"checkedAt"`
+	ResetDetector     *resetDetectorState `json:"resetDetector,omitempty"`
 }
 
 type appServer struct {
@@ -153,6 +160,7 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 	if !found {
+		current = initializeResetDetector(current)
 		log.Printf("初期状態を保存します: %s", formatState(current))
 		if err := saveState(cfg.statePath, current); err != nil {
 			return err
@@ -397,7 +405,7 @@ func selectWeeklyQuota(result rateLimitsResult) (quotaState, bool) {
 			UsedPercent:       window.UsedPercent,
 			WindowDurationMin: window.WindowDurationMin,
 			ResetsAt:          window.ResetsAt,
-			CheckedAt:         time.Now().Unix(),
+			CheckedAt:         time.Now().UnixNano(),
 		}
 		found = true
 	}
@@ -434,15 +442,16 @@ func processCurrentState(ctx context.Context, cfg config, current quotaState) er
 		return err
 	}
 	if !found {
-		return saveState(cfg.statePath, current)
+		return saveState(cfg.statePath, initializeResetDetector(current))
 	}
 
 	return processQuotaChange(ctx, cfg, previous, current)
 }
 
 func processQuotaChange(ctx context.Context, cfg config, previous, current quotaState) error {
-	if !quotaRecovered(previous, current) {
-		return saveState(cfg.statePath, current)
+	next, recovered := observeQuota(previous, current)
+	if !recovered {
+		return saveState(cfg.statePath, next)
 	}
 
 	log.Printf("利用枠の回復を検知しました: %s -> %s", formatState(previous), formatState(current))
@@ -450,8 +459,8 @@ func processQuotaChange(ctx context.Context, cfg config, previous, current quota
 		return fmt.Errorf("アンカー実行に失敗しました: %w", err)
 	}
 
-	current.CheckedAt = time.Now().Unix()
-	if err := saveState(cfg.statePath, current); err != nil {
+	next.CheckedAt = time.Now().UnixNano()
+	if err := saveState(cfg.statePath, next); err != nil {
 		return err
 	}
 
@@ -459,23 +468,79 @@ func processQuotaChange(ctx context.Context, cfg config, previous, current quota
 	return nil
 }
 
-func quotaRecovered(previous, current quotaState) bool {
-	if previous.LimitID != current.LimitID || previous.WindowName != current.WindowName {
+func observeQuota(previous, current quotaState) (quotaState, bool) {
+	if previous.LimitID != current.LimitID ||
+		previous.WindowName != current.WindowName ||
+		previous.WindowDurationMin != current.WindowDurationMin {
+		return initializeResetDetector(current), false
+	}
+
+	if current.CheckedAt <= previous.CheckedAt {
+		return previous, false
+	}
+
+	previousDetector := detectorFromState(previous)
+	currentAboveThreshold := current.UsedPercent > limitResetThresholdPercent
+	crossedBelowThreshold := previousDetector.WasAboveThreshold && !currentAboveThreshold
+	boundaryAdvanced := resetBoundaryAdvanced(previousDetector.ResetBoundary, current.ResetsAt)
+	recovered := crossedBelowThreshold && boundaryAdvanced
+	suppressedCrossing := crossedBelowThreshold && !boundaryAdvanced
+
+	nextBoundary := current.ResetsAt
+	if !boundaryAdvanced && previousDetector.ResetBoundary > 0 {
+		nextBoundary = previousDetector.ResetBoundary
+	}
+
+	nextAboveThreshold := currentAboveThreshold
+	if suppressedCrossing {
+		nextAboveThreshold = true
+	}
+
+	current.ResetDetector = &resetDetectorState{
+		WasAboveThreshold: nextAboveThreshold,
+		ResetBoundary:     nextBoundary,
+	}
+
+	return current, recovered
+}
+
+func initializeResetDetector(state quotaState) quotaState {
+	state.ResetDetector = &resetDetectorState{
+		WasAboveThreshold: state.UsedPercent > limitResetThresholdPercent,
+		ResetBoundary:     state.ResetsAt,
+	}
+	return state
+}
+
+func detectorFromState(state quotaState) resetDetectorState {
+	if state.ResetDetector != nil {
+		return *state.ResetDetector
+	}
+
+	return resetDetectorState{
+		WasAboveThreshold: state.UsedPercent > limitResetThresholdPercent,
+		ResetBoundary:     state.ResetsAt,
+	}
+}
+
+func resetBoundaryAdvanced(previous, current int64) bool {
+	if previous <= 0 || current <= 0 || current <= previous {
 		return false
 	}
 
-	usageDropped := previous.UsedPercent-current.UsedPercent >= minimumUsageDropPercent
-	resetMovedForward := current.ResetsAt > previous.ResetsAt && current.UsedPercent <= previous.UsedPercent
-	return usageDropped || resetMovedForward
+	return time.Duration(current-previous)*time.Second >=
+		resetBoundaryEquivalenceTolerance
 }
 
 func runAnchor(ctx context.Context, cfg config) error {
 	args := []string{
+		"--ask-for-approval",
+		"never",
 		"exec",
 		"--ephemeral",
 		"--skip-git-repo-check",
-		"--sandbox", "read-only",
-		"--ask-for-approval", "never",
+		"--sandbox",
+		"read-only",
 	}
 	if cfg.anchorModel != "" {
 		args = append(args, "--model", cfg.anchorModel)
