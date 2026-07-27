@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +28,9 @@ const (
 	limitResetThresholdPercent        = 1.0
 	resetBoundaryEquivalenceTolerance = 2 * time.Minute
 	minimumWeeklyWindow               = 24 * time.Hour
+	rpcInitializeTimeout              = 8 * time.Second
+	rpcRequestTimeout                 = 3 * time.Second
+	rpcShutdownGrace                  = 500 * time.Millisecond
 )
 
 type config struct {
@@ -91,12 +96,19 @@ type appServer struct {
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
 	responses chan rpcMessage
-	notices   chan rpcMessage
 	errCh     chan error
+	done      chan struct{}
 
 	writeMu sync.Mutex
 	idMu    sync.Mutex
 	nextID  int64
+
+	stateMu   sync.Mutex
+	closing   bool
+	closeOnce sync.Once
+
+	stderrMu sync.Mutex
+	stderr   bytes.Buffer
 }
 
 func main() {
@@ -140,34 +152,19 @@ func parseConfig() (config, error) {
 }
 
 func run(ctx context.Context, cfg config) error {
-	server, err := startAppServer(ctx, cfg.codexPath)
-	if err != nil {
-		return err
-	}
-	defer server.close()
-
-	if err := server.initialize(ctx); err != nil {
-		return err
-	}
-
-	current, err := server.readWeeklyQuota(ctx)
-	if err != nil {
-		return err
-	}
-
-	previous, found, err := loadState(cfg.statePath)
-	if err != nil {
-		return err
-	}
-	if !found {
-		current = initializeResetDetector(current)
-		log.Printf("初期状態を保存します: %s", formatState(current))
-		if err := saveState(cfg.statePath, current); err != nil {
-			return err
+	poll := func() {
+		quota, err := readWeeklyQuotaOnce(ctx, cfg.codexPath)
+		if err != nil {
+			log.Printf("利用枠の取得に失敗しました: %v", err)
+			return
 		}
-	} else if err := processQuotaChange(ctx, cfg, previous, current); err != nil {
-		return err
+
+		if err := processCurrentState(ctx, cfg, quota); err != nil {
+			log.Printf("利用枠の処理に失敗しました: %v", err)
+		}
 	}
+
+	poll()
 
 	ticker := time.NewTicker(cfg.pollEvery)
 	defer ticker.Stop()
@@ -176,35 +173,37 @@ func run(ctx context.Context, cfg config) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-server.errCh:
-			return err
-		case notice := <-server.notices:
-			if notice.Method != "account/rateLimits/updated" {
-				continue
-			}
-
-			quota, ok := weeklyQuotaFromNotification(notice)
-			if !ok {
-				continue
-			}
-			if err := processCurrentState(ctx, cfg, quota); err != nil {
-				log.Printf("通知の処理に失敗しました: %v", err)
-			}
 		case <-ticker.C:
-			quota, err := server.readWeeklyQuota(ctx)
-			if err != nil {
-				log.Printf("利用枠の取得に失敗しました: %v", err)
-				continue
-			}
-			if err := processCurrentState(ctx, cfg, quota); err != nil {
-				log.Printf("利用枠の処理に失敗しました: %v", err)
-			}
+			poll()
 		}
 	}
 }
 
+func readWeeklyQuotaOnce(ctx context.Context, codexPath string) (quotaState, error) {
+	server, err := startAppServer(ctx, codexPath)
+	if err != nil {
+		return quotaState{}, err
+	}
+	defer server.close()
+
+	if err := server.initialize(ctx); err != nil {
+		return quotaState{}, err
+	}
+
+	return server.readWeeklyQuota(ctx)
+}
+
 func startAppServer(ctx context.Context, codexPath string) (*appServer, error) {
-	cmd := exec.CommandContext(ctx, codexPath, "app-server")
+	cmd := exec.CommandContext(
+		ctx,
+		codexPath,
+		"-s",
+		"read-only",
+		"-a",
+		"untrusted",
+		"app-server",
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -216,7 +215,11 @@ func startAppServer(ctx context.Context, codexPath string) (*appServer, error) {
 		return nil, fmt.Errorf("app-serverの標準出力を開けません: %w", err)
 	}
 
-	cmd.Stderr = os.Stderr
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("app-serverの標準エラーを開けません: %w", err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("codex app-serverを起動できません: %w", err)
 	}
@@ -225,12 +228,14 @@ func startAppServer(ctx context.Context, codexPath string) (*appServer, error) {
 		cmd:       cmd,
 		stdin:     stdin,
 		responses: make(chan rpcMessage, 16),
-		notices:   make(chan rpcMessage, 32),
 		errCh:     make(chan error, 1),
+		done:      make(chan struct{}),
 		nextID:    1,
 	}
 
 	go server.readLoop(stdout)
+	go server.readStderr(stderr)
+
 	return server, nil
 }
 
@@ -243,7 +248,7 @@ func (s *appServer) initialize(ctx context.Context) error {
 		},
 	}
 
-	if _, err := s.call(ctx, "initialize", params); err != nil {
+	if _, err := s.call(ctx, "initialize", params, rpcInitializeTimeout); err != nil {
 		return fmt.Errorf("app-serverの初期化に失敗しました: %w", err)
 	}
 	if err := s.notify("initialized", map[string]any{}); err != nil {
@@ -254,7 +259,7 @@ func (s *appServer) initialize(ctx context.Context) error {
 }
 
 func (s *appServer) readWeeklyQuota(ctx context.Context) (quotaState, error) {
-	result, err := s.call(ctx, "account/rateLimits/read", nil)
+	result, err := s.call(ctx, "account/rateLimits/read", nil, rpcRequestTimeout)
 	if err != nil {
 		return quotaState{}, err
 	}
@@ -272,7 +277,12 @@ func (s *appServer) readWeeklyQuota(ctx context.Context) (quotaState, error) {
 	return quota, nil
 }
 
-func (s *appServer) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+func (s *appServer) call(
+	ctx context.Context,
+	method string,
+	params any,
+	timeout time.Duration,
+) (json.RawMessage, error) {
 	id := s.newID()
 	request := map[string]any{
 		"id":     id,
@@ -286,12 +296,26 @@ func (s *appServer) call(ctx context.Context, method string, params any) (json.R
 		return nil, err
 	}
 
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	for {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-requestCtx.Done():
+			s.close()
+			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf(
+					"Codex RPCがタイムアウトしました: method=%s timeout=%s%s",
+					method,
+					timeout,
+					s.stderrSuffix(),
+				)
+			}
+			return nil, requestCtx.Err()
+
 		case err := <-s.errCh:
-			return nil, err
+			return nil, fmt.Errorf("%w%s", err, s.stderrSuffix())
+
 		case response := <-s.responses:
 			if response.ID == nil || *response.ID != id {
 				continue
@@ -332,21 +356,20 @@ func (s *appServer) writeJSON(value any) error {
 }
 
 func (s *appServer) readLoop(stdout io.Reader) {
+	defer close(s.done)
+
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 
 	for scanner.Scan() {
 		var message rpcMessage
 		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
-			log.Printf("app-serverから不正なJSONを受信しました: %v", err)
 			continue
 		}
 
 		if message.ID != nil {
 			s.responses <- message
-			continue
 		}
-		s.notices <- message
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -354,11 +377,28 @@ func (s *appServer) readLoop(stdout io.Reader) {
 		return
 	}
 
-	if err := s.cmd.Wait(); err != nil {
+	if err := s.cmd.Wait(); err != nil && !s.isClosing() {
 		s.reportError(fmt.Errorf("app-serverが終了しました: %w", err))
 		return
 	}
-	s.reportError(errors.New("app-serverが終了しました"))
+
+	if !s.isClosing() {
+		s.reportError(errors.New("app-serverが終了しました"))
+	}
+}
+
+func (s *appServer) readStderr(stderr io.Reader) {
+	scanner := bufio.NewScanner(stderr)
+	scanner.Buffer(make([]byte, 16*1024), 256*1024)
+
+	for scanner.Scan() {
+		s.stderrMu.Lock()
+		if s.stderr.Len() < 64*1024 {
+			s.stderr.WriteString(scanner.Text())
+			s.stderr.WriteByte('\n')
+		}
+		s.stderrMu.Unlock()
+	}
 }
 
 func (s *appServer) newID() int64 {
@@ -377,11 +417,62 @@ func (s *appServer) reportError(err error) {
 	}
 }
 
+func (s *appServer) isClosing() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.closing
+}
+
+func (s *appServer) markClosing() {
+	s.stateMu.Lock()
+	s.closing = true
+	s.stateMu.Unlock()
+}
+
 func (s *appServer) close() {
-	_ = s.stdin.Close()
-	if s.cmd.Process != nil {
-		_ = s.cmd.Process.Signal(os.Interrupt)
+	s.closeOnce.Do(func() {
+		s.markClosing()
+		_ = s.stdin.Close()
+
+		if s.cmd.Process == nil {
+			return
+		}
+
+		signalProcessGroup(s.cmd, syscall.SIGINT)
+		select {
+		case <-s.done:
+			return
+		case <-time.After(rpcShutdownGrace):
+		}
+
+		signalProcessGroup(s.cmd, syscall.SIGKILL)
+		select {
+		case <-s.done:
+		case <-time.After(rpcShutdownGrace):
+		}
+	})
+}
+
+func signalProcessGroup(cmd *exec.Cmd, signal syscall.Signal) {
+	if cmd.Process == nil {
+		return
 	}
+
+	if err := syscall.Kill(-cmd.Process.Pid, signal); err != nil {
+		_ = cmd.Process.Signal(signal)
+	}
+}
+
+func (s *appServer) stderrSuffix() string {
+	s.stderrMu.Lock()
+	defer s.stderrMu.Unlock()
+
+	text := strings.TrimSpace(s.stderr.String())
+	if text == "" {
+		return ""
+	}
+
+	return "\ncodex stderr:\n" + text
 }
 
 func selectWeeklyQuota(result rateLimitsResult) (quotaState, bool) {
@@ -424,16 +515,6 @@ func selectWeeklyQuota(result rateLimitsResult) (quotaState, bool) {
 	}
 
 	return selected, found
-}
-
-func weeklyQuotaFromNotification(message rpcMessage) (quotaState, bool) {
-	var params rateLimitsUpdatedParams
-	if err := json.Unmarshal(message.Params, &params); err != nil {
-		return quotaState{}, false
-	}
-
-	result := rateLimitsResult{RateLimits: &params.RateLimits}
-	return selectWeeklyQuota(result)
 }
 
 func processCurrentState(ctx context.Context, cfg config, current quotaState) error {

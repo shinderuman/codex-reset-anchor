@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 func testState(used float64, resetsAt, checkedAt int64) quotaState {
 	state := quotaState{
@@ -108,5 +114,42 @@ func TestLegacyStateMigratesDetector(t *testing.T) {
 	_, recovered := observeQuota(previous, current)
 	if !recovered {
 		t.Fatal("旧状態ファイルから検知状態を移行できなかった")
+	}
+}
+
+func TestRPCRequestTimeoutTerminatesServer(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+    sleep 30
+done
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("stub codexを書けなかった: %v", err)
+	}
+
+	server, err := startAppServer(context.Background(), scriptPath)
+	if err != nil {
+		t.Fatalf("stub app-serverを起動できなかった: %v", err)
+	}
+
+	startedAt := time.Now()
+	_, err = server.call(
+		context.Background(),
+		"account/rateLimits/read",
+		nil,
+		100*time.Millisecond,
+	)
+	if err == nil {
+		t.Fatal("タイムアウトせず成功した")
+	}
+	if time.Since(startedAt) > 2*time.Second {
+		t.Fatalf("タイムアウト後の終了が遅すぎる: %s", time.Since(startedAt))
+	}
+
+	select {
+	case <-server.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("タイムアウト後もapp-serverが終了していない")
 	}
 }
