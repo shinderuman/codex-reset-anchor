@@ -24,12 +24,12 @@ import (
 const (
 	clientName                        = "codex-reset-anchor"
 	clientTitle                       = "Codex Reset Anchor"
-	clientVersion                     = "0.1.0"
+	clientVersion                     = "0.2.0"
 	limitResetThresholdPercent        = 1.0
 	resetBoundaryEquivalenceTolerance = 2 * time.Minute
 	minimumWeeklyWindow               = 24 * time.Hour
 	rpcInitializeTimeout              = 8 * time.Second
-	rpcRequestTimeout                 = 3 * time.Second
+	rpcRequestTimeout                 = 15 * time.Second
 	rpcShutdownGrace                  = 500 * time.Millisecond
 )
 
@@ -71,10 +71,6 @@ type rateLimitBucket struct {
 type rateLimitsResult struct {
 	RateLimits          *rateLimitBucket           `json:"rateLimits"`
 	RateLimitsByLimitID map[string]rateLimitBucket `json:"rateLimitsByLimitId"`
-}
-
-type rateLimitsUpdatedParams struct {
-	RateLimits rateLimitBucket `json:"rateLimits"`
 }
 
 type resetDetectorState struct {
@@ -140,7 +136,7 @@ func parseConfig() (config, error) {
 		"状態ファイルのパス",
 	)
 	flag.DurationVar(&cfg.pollEvery, "interval", 5*time.Minute, "利用枠の確認間隔")
-	flag.StringVar(&cfg.prompt, "prompt", "Reply with only OK.", "アンカー用プロンプト")
+	flag.StringVar(&cfg.prompt, "prompt", "Reply only: OK", "アンカー用プロンプト")
 	flag.StringVar(&cfg.anchorModel, "model", "", "アンカー実行に使うモデル。空ならCodex既定値")
 	flag.Parse()
 
@@ -540,6 +536,10 @@ func processQuotaChange(ctx context.Context, cfg config, previous, current quota
 		return fmt.Errorf("アンカー実行に失敗しました: %w", err)
 	}
 
+	next.ResetDetector = &resetDetectorState{
+		WasAboveThreshold: true,
+		ResetBoundary:     current.ResetsAt,
+	}
 	next.CheckedAt = time.Now().UnixNano()
 	if err := saveState(cfg.statePath, next); err != nil {
 		return err
@@ -614,6 +614,11 @@ func resetBoundaryAdvanced(previous, current int64) bool {
 }
 
 func runAnchor(ctx context.Context, cfg config) error {
+	workDirectory := filepath.Dir(cfg.statePath)
+	if err := os.MkdirAll(workDirectory, 0o755); err != nil {
+		return fmt.Errorf("アンカー実行用ディレクトリを作成できません: %w", err)
+	}
+
 	args := []string{
 		"--ask-for-approval",
 		"never",
@@ -622,20 +627,31 @@ func runAnchor(ctx context.Context, cfg config) error {
 		"--skip-git-repo-check",
 		"--sandbox",
 		"read-only",
+		"--color",
+		"never",
 	}
 	if cfg.anchorModel != "" {
 		args = append(args, "--model", cfg.anchorModel)
 	}
 	args = append(args, cfg.prompt)
 
+	var stderr bytes.Buffer
+
 	cmd := exec.CommandContext(ctx, cfg.codexPath, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Dir = workDirectory
 	cmd.Stdin = nil
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("codex execが失敗しました: %w", err)
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			return fmt.Errorf("codex execが失敗しました: %w", err)
+		}
+
+		return fmt.Errorf("codex execが失敗しました: %w\n%s", err, message)
 	}
+
 	return nil
 }
 

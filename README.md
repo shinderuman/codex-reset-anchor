@@ -35,7 +35,7 @@ go build -o codex-reset-anchor .
 | `-codex`      | `codex`                                                               | codex コマンドのパス                   |
 | `-state`      | `~/.local/var/codex-reset-anchor/state.json`                          | 状態ファイルのパス                     |
 | `-interval`   | `5m`                                                                  | 利用枠の確認間隔（1分以上）            |
-| `-prompt`     | `Reply with only OK.`                                                 | アンカー実行に使うプロンプト           |
+| `-prompt`     | `Reply only: OK`                                                      | アンカー実行に使うプロンプト           |
 | `-model`      | （空）                                                                | アンカー実行に使うモデル。空なら Codex 既定値 |
 
 ### 実行例
