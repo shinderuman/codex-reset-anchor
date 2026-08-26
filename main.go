@@ -24,10 +24,12 @@ import (
 const (
 	clientName                        = "codex-reset-anchor"
 	clientTitle                       = "Codex Reset Anchor"
-	clientVersion                     = "0.2.0"
+	clientVersion                     = "0.3.0"
 	limitResetThresholdPercent        = 1.0
 	resetBoundaryEquivalenceTolerance = 2 * time.Minute
-	minimumWeeklyWindow               = 24 * time.Hour
+	fiveHourWindowMinutes             = int64(300)
+	weeklyWindowMinutes               = int64(7 * 24 * 60)
+	stateVersion                      = 2
 	rpcInitializeTimeout              = 8 * time.Second
 	rpcRequestTimeout                 = 15 * time.Second
 	rpcShutdownGrace                  = 500 * time.Millisecond
@@ -86,6 +88,17 @@ type quotaState struct {
 	ResetsAt          int64               `json:"resetsAt"`
 	CheckedAt         int64               `json:"checkedAt"`
 	ResetDetector     *resetDetectorState `json:"resetDetector,omitempty"`
+}
+
+type quotaSnapshot struct {
+	FiveHour *quotaState
+	Weekly   *quotaState
+}
+
+type monitorState struct {
+	Version  int         `json:"version"`
+	FiveHour *quotaState `json:"fiveHour,omitempty"`
+	Weekly   *quotaState `json:"weekly,omitempty"`
 }
 
 type appServer struct {
@@ -149,13 +162,13 @@ func parseConfig() (config, error) {
 
 func run(ctx context.Context, cfg config) error {
 	poll := func() {
-		quota, err := readWeeklyQuotaOnce(ctx, cfg.codexPath)
+		quotas, err := readQuotasOnce(ctx, cfg.codexPath)
 		if err != nil {
 			log.Printf("利用枠の取得に失敗しました: %v", err)
 			return
 		}
 
-		if err := processCurrentState(ctx, cfg, quota); err != nil {
+		if err := processCurrentSnapshot(ctx, cfg, quotas); err != nil {
 			log.Printf("利用枠の処理に失敗しました: %v", err)
 		}
 	}
@@ -175,18 +188,18 @@ func run(ctx context.Context, cfg config) error {
 	}
 }
 
-func readWeeklyQuotaOnce(ctx context.Context, codexPath string) (quotaState, error) {
+func readQuotasOnce(ctx context.Context, codexPath string) (quotaSnapshot, error) {
 	server, err := startAppServer(ctx, codexPath)
 	if err != nil {
-		return quotaState{}, err
+		return quotaSnapshot{}, err
 	}
 	defer server.close()
 
 	if err := server.initialize(ctx); err != nil {
-		return quotaState{}, err
+		return quotaSnapshot{}, err
 	}
 
-	return server.readWeeklyQuota(ctx)
+	return server.readQuotas(ctx)
 }
 
 func startAppServer(ctx context.Context, codexPath string) (*appServer, error) {
@@ -254,23 +267,23 @@ func (s *appServer) initialize(ctx context.Context) error {
 	return nil
 }
 
-func (s *appServer) readWeeklyQuota(ctx context.Context) (quotaState, error) {
+func (s *appServer) readQuotas(ctx context.Context) (quotaSnapshot, error) {
 	result, err := s.call(ctx, "account/rateLimits/read", nil, rpcRequestTimeout)
 	if err != nil {
-		return quotaState{}, err
+		return quotaSnapshot{}, err
 	}
 
 	var limits rateLimitsResult
 	if err := json.Unmarshal(result, &limits); err != nil {
-		return quotaState{}, fmt.Errorf("レート制限レスポンスを解析できません: %w", err)
+		return quotaSnapshot{}, fmt.Errorf("レート制限レスポンスを解析できません: %w", err)
 	}
 
-	quota, ok := selectWeeklyQuota(limits)
-	if !ok {
-		return quotaState{}, errors.New("週次相当のレート制限ウィンドウが見つかりません")
+	quotas := selectQuotaSnapshot(limits)
+	if quotas.FiveHour == nil && quotas.Weekly == nil {
+		return quotaSnapshot{}, errors.New("5時間または週次相当のレート制限ウィンドウが見つかりません")
 	}
 
-	return quota, nil
+	return quotas, nil
 }
 
 func (s *appServer) call(
@@ -471,30 +484,37 @@ func (s *appServer) stderrSuffix() string {
 	return "\ncodex stderr:\n" + text
 }
 
-func selectWeeklyQuota(result rateLimitsResult) (quotaState, bool) {
-	var selected quotaState
-	found := false
+func selectQuotaSnapshot(result rateLimitsResult) quotaSnapshot {
+	var selected quotaSnapshot
+	checkedAt := time.Now().UnixNano()
 
 	consider := func(bucket rateLimitBucket, name string, window *rateLimitWindow) {
 		if window == nil {
 			return
 		}
-		if time.Duration(window.WindowDurationMin)*time.Minute < minimumWeeklyWindow {
-			return
-		}
-		if found && window.WindowDurationMin <= selected.WindowDurationMin {
-			return
-		}
 
-		selected = quotaState{
+		candidate := quotaState{
 			LimitID:           bucket.LimitID,
 			WindowName:        name,
 			UsedPercent:       window.UsedPercent,
 			WindowDurationMin: window.WindowDurationMin,
 			ResetsAt:          window.ResetsAt,
-			CheckedAt:         time.Now().UnixNano(),
+			CheckedAt:         checkedAt,
 		}
-		found = true
+
+		if window.WindowDurationMin == fiveHourWindowMinutes {
+			if selected.FiveHour == nil || preferCandidate(*selected.FiveHour, candidate) {
+				copy := candidate
+				selected.FiveHour = &copy
+			}
+		}
+
+		if window.WindowDurationMin == weeklyWindowMinutes {
+			if selected.Weekly == nil || preferCandidate(*selected.Weekly, candidate) {
+				copy := candidate
+				selected.Weekly = &copy
+			}
+		}
 	}
 
 	for limitID, bucket := range result.RateLimitsByLimitID {
@@ -510,38 +530,64 @@ func selectWeeklyQuota(result rateLimitsResult) (quotaState, bool) {
 		consider(*result.RateLimits, "secondary", result.RateLimits.Secondary)
 	}
 
-	return selected, found
+	return selected
 }
 
-func processCurrentState(ctx context.Context, cfg config, current quotaState) error {
-	previous, found, err := loadState(cfg.statePath)
+func preferCandidate(current, candidate quotaState) bool {
+	return current.LimitID != "codex" && candidate.LimitID == "codex"
+}
+
+func processCurrentSnapshot(ctx context.Context, cfg config, current quotaSnapshot) error {
+	previous, found, err := loadMonitorState(cfg.statePath)
 	if err != nil {
 		return err
 	}
 	if !found {
-		return saveState(cfg.statePath, initializeResetDetector(current))
+		initial := monitorState{Version: stateVersion}
+		if current.FiveHour != nil {
+			value := initializeResetDetector(*current.FiveHour)
+			initial.FiveHour = &value
+		}
+		if current.Weekly != nil {
+			value := initializeResetDetector(*current.Weekly)
+			initial.Weekly = &value
+		}
+		return saveMonitorState(cfg.statePath, initial)
 	}
 
-	return processQuotaChange(ctx, cfg, previous, current)
-}
+	next := monitorState{Version: stateVersion}
+	recovered := make([]string, 0, 2)
 
-func processQuotaChange(ctx context.Context, cfg config, previous, current quotaState) error {
-	next, recovered := observeQuota(previous, current)
-	if !recovered {
-		return saveState(cfg.statePath, next)
+	var fiveHourRecovered bool
+	next.FiveHour, fiveHourRecovered = observeOptionalQuota(previous.FiveHour, current.FiveHour)
+	if fiveHourRecovered {
+		recovered = append(recovered, "5h")
 	}
 
-	log.Printf("利用枠の回復を検知しました: %s -> %s", formatState(previous), formatState(current))
+	var weeklyRecovered bool
+	next.Weekly, weeklyRecovered = observeOptionalQuota(previous.Weekly, current.Weekly)
+	if weeklyRecovered {
+		recovered = append(recovered, "weekly")
+	}
+
+	if len(recovered) == 0 {
+		return saveMonitorState(cfg.statePath, next)
+	}
+
+	log.Printf("利用枠の回復を検知しました: %s", strings.Join(recovered, ","))
 	if err := runAnchor(ctx, cfg); err != nil {
 		return fmt.Errorf("アンカー実行に失敗しました: %w", err)
 	}
 
-	next.ResetDetector = &resetDetectorState{
-		WasAboveThreshold: true,
-		ResetBoundary:     current.ResetsAt,
+	now := time.Now().UnixNano()
+	if next.FiveHour != nil {
+		armAfterAnchor(next.FiveHour, now)
 	}
-	next.CheckedAt = time.Now().UnixNano()
-	if err := saveState(cfg.statePath, next); err != nil {
+	if next.Weekly != nil {
+		armAfterAnchor(next.Weekly, now)
+	}
+
+	if err := saveMonitorState(cfg.statePath, next); err != nil {
 		return err
 	}
 
@@ -549,9 +595,33 @@ func processQuotaChange(ctx context.Context, cfg config, previous, current quota
 	return nil
 }
 
+func observeOptionalQuota(previous, current *quotaState) (*quotaState, bool) {
+	if current == nil {
+		if previous == nil {
+			return nil, false
+		}
+		copy := *previous
+		return &copy, false
+	}
+	if previous == nil {
+		value := initializeResetDetector(*current)
+		return &value, false
+	}
+
+	next, recovered := observeQuota(*previous, *current)
+	return &next, recovered
+}
+
+func armAfterAnchor(state *quotaState, checkedAt int64) {
+	state.ResetDetector = &resetDetectorState{
+		WasAboveThreshold: true,
+		ResetBoundary:     state.ResetsAt,
+	}
+	state.CheckedAt = checkedAt
+}
+
 func observeQuota(previous, current quotaState) (quotaState, bool) {
 	if previous.LimitID != current.LimitID ||
-		previous.WindowName != current.WindowName ||
 		previous.WindowDurationMin != current.WindowDurationMin {
 		return initializeResetDetector(current), false
 	}
@@ -655,28 +725,58 @@ func runAnchor(ctx context.Context, cfg config) error {
 	return nil
 }
 
-func loadState(path string) (quotaState, bool, error) {
+func loadMonitorState(path string) (monitorState, bool, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return quotaState{}, false, nil
+		return monitorState{}, false, nil
 	}
 	if err != nil {
-		return quotaState{}, false, fmt.Errorf("状態ファイルを読めません: %w", err)
+		return monitorState{}, false, fmt.Errorf("状態ファイルを読めません: %w", err)
 	}
 
-	var state quotaState
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return monitorState{}, false, fmt.Errorf("状態ファイルを解析できません: %w", err)
+	}
+
+	if _, ok := keys["limitId"]; ok {
+		var legacy quotaState
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return monitorState{}, false, fmt.Errorf("旧状態ファイルを解析できません: %w", err)
+		}
+		state := monitorState{Version: stateVersion}
+		switch {
+		case legacy.WindowDurationMin == fiveHourWindowMinutes:
+			state.FiveHour = &legacy
+		case legacy.WindowDurationMin == weeklyWindowMinutes:
+			state.Weekly = &legacy
+		default:
+			state.Weekly = &legacy
+		}
+		return state, true, nil
+	}
+
+	var state monitorState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return quotaState{}, false, fmt.Errorf("状態ファイルを解析できません: %w", err)
+		return monitorState{}, false, fmt.Errorf("状態ファイルを解析できません: %w", err)
+	}
+	if state.Version != stateVersion {
+		return monitorState{}, false, fmt.Errorf("未対応の状態ファイルversionです: %d", state.Version)
 	}
 	return state, true, nil
 }
 
-func saveState(path string, state quotaState) error {
+func saveMonitorState(path string, state monitorState) error {
+	state.Version = stateVersion
+	return saveJSONAtomic(path, state)
+}
+
+func saveJSONAtomic(path string, value any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("状態ディレクトリを作成できません: %w", err)
 	}
 
-	data, err := json.MarshalIndent(state, "", "  ")
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return fmt.Errorf("状態JSONを生成できません: %w", err)
 	}
@@ -691,16 +791,4 @@ func saveState(path string, state quotaState) error {
 		return fmt.Errorf("状態ファイルを更新できません: %w", err)
 	}
 	return nil
-}
-
-func formatState(state quotaState) string {
-	resetTime := time.Unix(state.ResetsAt, 0).Local().Format("2006-01-02 15:04:05")
-	return fmt.Sprintf(
-		"limit=%s window=%s duration=%dm used=%.1f%% reset=%s",
-		state.LimitID,
-		state.WindowName,
-		state.WindowDurationMin,
-		state.UsedPercent,
-		resetTime,
-	)
 }
