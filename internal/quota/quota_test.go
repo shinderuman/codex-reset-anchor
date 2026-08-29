@@ -22,7 +22,17 @@ func TestRecoveredWhenKnownResetBoundaryElapsed(t *testing.T) {
 	current := testWindow(FiveHourWindowMinutes, 0, resetAt.Add(5*time.Hour).Unix(), resetAt.Add(time.Minute))
 
 	if !Recovered(previous, current) {
-		t.Fatal("既知のリセット時刻を通過した低使用率windowを回復として検知できなかった")
+		t.Fatal("既知のリセット時刻を通過したwindowを回復として検知できなかった")
+	}
+}
+
+func TestRecoveredAfterResetEvenWhenQuotaAlreadyUsed(t *testing.T) {
+	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
+	previous := testWindow(WeeklyWindowMinutes, 92, resetAt.Unix(), resetAt.Add(-time.Minute))
+	current := testWindow(WeeklyWindowMinutes, 17, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute))
+
+	if !Recovered(previous, current) {
+		t.Fatal("リセット後に利用が進んだweekly windowを回復として検知できなかった")
 	}
 }
 
@@ -36,16 +46,6 @@ func TestBoundaryMoveBeforeResetDoesNotRecover(t *testing.T) {
 	}
 }
 
-func TestUsedQuotaAfterResetDoesNotNeedAnchor(t *testing.T) {
-	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
-	previous := testWindow(WeeklyWindowMinutes, 80, resetAt.Unix(), resetAt.Add(-time.Minute))
-	current := testWindow(WeeklyWindowMinutes, 3, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute))
-
-	if Recovered(previous, current) {
-		t.Fatal("リセット後に既に利用されているwindowをanchor対象にした")
-	}
-}
-
 func TestSmallBoundaryJitterDoesNotRecover(t *testing.T) {
 	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
 	previous := testWindow(WeeklyWindowMinutes, 100, resetAt.Unix(), resetAt.Add(-time.Minute))
@@ -53,6 +53,17 @@ func TestSmallBoundaryJitterDoesNotRecover(t *testing.T) {
 
 	if Recovered(previous, current) {
 		t.Fatal("小さな境界差を回復として誤検知した")
+	}
+}
+
+func TestMissingLimitIDStillMatchesSameDurationWindow(t *testing.T) {
+	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
+	previous := testWindow(WeeklyWindowMinutes, 90, resetAt.Unix(), resetAt.Add(-time.Minute))
+	current := testWindow(WeeklyWindowMinutes, 0, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute))
+	current.LimitID = ""
+
+	if !Recovered(previous, current) {
+		t.Fatal("limitIdが一時欠落した同一duration windowを別windowとして扱った")
 	}
 }
 
