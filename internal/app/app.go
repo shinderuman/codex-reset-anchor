@@ -110,15 +110,20 @@ func processCurrentSnapshot(ctx context.Context, cfg config, current quota.Snaps
 
 	next := state.Monitor{Version: state.Version}
 	recovered := make([]string, 0, 2)
+	unused := make([]string, 0, 2)
+	alreadyUsed := make([]string, 0, 2)
+
 	fiveHour, recoveredFiveHour := observeOptionalQuota(previous.FiveHour, current.FiveHour)
 	next.FiveHour = fiveHour
 	if recoveredFiveHour {
 		recovered = append(recovered, "5h")
+		classifyRecoveredWindow("5h", fiveHour, &unused, &alreadyUsed)
 	}
 	weekly, recoveredWeekly := observeOptionalQuota(previous.Weekly, current.Weekly)
 	next.Weekly = weekly
 	if recoveredWeekly {
 		recovered = append(recovered, "weekly")
+		classifyRecoveredWindow("weekly", weekly, &unused, &alreadyUsed)
 	}
 
 	if len(recovered) == 0 {
@@ -126,6 +131,17 @@ func processCurrentSnapshot(ctx context.Context, cfg config, current quota.Snaps
 	}
 
 	log.Printf("利用枠の回復を検知しました: %s", strings.Join(recovered, ","))
+	if len(alreadyUsed) > 0 {
+		log.Printf("リセット後の利用を検知しました: %s", strings.Join(alreadyUsed, ","))
+	}
+	if len(unused) == 0 {
+		if err := state.Save(cfg.statePath, next); err != nil {
+			return err
+		}
+		log.Printf("アンカーをスキップしました: 回復した利用枠はすでに使用されています")
+		return nil
+	}
+
 	if err := anchor.RunAnchor(ctx, filepath.Dir(cfg.statePath), cfg.prompt, cfg.anchorModel, cfg.anchorTimeout); err != nil {
 		return fmt.Errorf("アンカー実行に失敗しました: %w", err)
 	}
@@ -134,6 +150,14 @@ func processCurrentSnapshot(ctx context.Context, cfg config, current quota.Snaps
 	}
 	log.Printf("アンカー実行が完了しました")
 	return nil
+}
+
+func classifyRecoveredWindow(name string, window *quota.Window, unused, alreadyUsed *[]string) {
+	if window != nil && window.UsedPercent > 0 {
+		*alreadyUsed = append(*alreadyUsed, fmt.Sprintf("%s(usedPercent=%.1f%%)", name, window.UsedPercent))
+		return
+	}
+	*unused = append(*unused, name)
 }
 
 func observeOptionalQuota(previous, current *quota.Window) (*quota.Window, bool) {
