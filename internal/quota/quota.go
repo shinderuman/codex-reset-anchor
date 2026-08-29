@@ -6,8 +6,7 @@ const (
 	FiveHourWindowMinutes = int64(300)
 	WeeklyWindowMinutes   = int64(7 * 24 * 60)
 
-	resetThresholdPercent = 1.0
-	boundaryTolerance     = 2 * time.Minute
+	boundaryTolerance = 2 * time.Minute
 )
 
 type Window struct {
@@ -24,21 +23,28 @@ type Snapshot struct {
 	Weekly   *Window
 }
 
+func SameWindow(previous, current Window) bool {
+	if previous.WindowDurationMin != current.WindowDurationMin {
+		return false
+	}
+	return previous.LimitID == current.LimitID || previous.LimitID == "" || current.LimitID == ""
+}
+
 func Recovered(previous, current Window) bool {
-	if previous.LimitID != current.LimitID || previous.WindowDurationMin != current.WindowDurationMin {
+	if !SameWindow(previous, current) {
 		return false
 	}
 	if current.CheckedAt <= previous.CheckedAt {
 		return false
 	}
-	if current.UsedPercent > resetThresholdPercent {
+	if previous.ResetsAt <= 0 {
 		return false
 	}
-	if !resetBoundaryAdvanced(previous.ResetsAt, current.ResetsAt) {
+	if current.CheckedAt < time.Unix(previous.ResetsAt, 0).UnixNano() {
 		return false
 	}
 
-	return previous.ResetsAt > 0 && current.CheckedAt >= time.Unix(previous.ResetsAt, 0).UnixNano()
+	return resetBoundaryAdvanced(previous.ResetsAt, current.ResetsAt)
 }
 
 func resetBoundaryAdvanced(previous, current int64) bool {

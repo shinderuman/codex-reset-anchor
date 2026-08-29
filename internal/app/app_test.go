@@ -93,6 +93,46 @@ func TestSimultaneousResetsRunSingleAnchor(t *testing.T) {
 	}
 }
 
+func TestWeeklyResetSurvivesMissingBoundaryAndActiveUsage(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	cfg := config{statePath: statePath, prompt: "Reply only: OK"}
+	anchor := &fakeAnchor{}
+	resetAt := time.Date(2026, 8, 30, 6, 30, 0, 0, time.UTC)
+	previous := state.Monitor{
+		Weekly: window(quota.WeeklyWindowMinutes, 92, resetAt.Unix(), resetAt.Add(-time.Minute)),
+	}
+	if err := state.Save(statePath, previous); err != nil {
+		t.Fatal(err)
+	}
+
+	sparse := quota.Snapshot{
+		Weekly: window(quota.WeeklyWindowMinutes, 17, 0, resetAt.Add(time.Minute)),
+	}
+	if err := processCurrentSnapshot(context.Background(), cfg, sparse, anchor); err != nil {
+		t.Fatalf("resetsAt欠落pollの処理に失敗した: %v", err)
+	}
+	if anchor.calls != 0 {
+		t.Fatalf("次回境界が不明な状態でanchorした: %d", anchor.calls)
+	}
+	preserved, found, err := state.Load(statePath)
+	if err != nil || !found {
+		t.Fatalf("stateを再読込できなかった: found=%v err=%v", found, err)
+	}
+	if preserved.Weekly == nil || preserved.Weekly.ResetsAt != resetAt.Unix() {
+		t.Fatalf("既知のweekly reset境界を保持しなかった: %+v", preserved.Weekly)
+	}
+
+	resolved := quota.Snapshot{
+		Weekly: window(quota.WeeklyWindowMinutes, 23, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(6*time.Minute)),
+	}
+	if err := processCurrentSnapshot(context.Background(), cfg, resolved, anchor); err != nil {
+		t.Fatalf("weekly reset確定pollの処理に失敗した: %v", err)
+	}
+	if anchor.calls != 1 {
+		t.Fatalf("利用が進んだweekly resetでanchorしなかった: %d", anchor.calls)
+	}
+}
+
 func TestFailedAnchorDoesNotAdvanceState(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	cfg := config{statePath: statePath, prompt: "Reply only: OK"}

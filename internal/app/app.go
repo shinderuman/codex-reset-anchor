@@ -143,7 +143,17 @@ func observeOptionalQuota(previous, current *quota.Window) (*quota.Window, bool)
 	if previous == nil {
 		return cloneWindow(current), false
 	}
-	return cloneWindow(current), quota.Recovered(*previous, *current)
+
+	observed := *current
+	if quota.SameWindow(*previous, observed) {
+		if observed.LimitID == "" {
+			observed.LimitID = previous.LimitID
+		}
+		if observed.ResetsAt <= 0 {
+			observed.ResetsAt = previous.ResetsAt
+		}
+	}
+	return &observed, quota.Recovered(*previous, observed)
 }
 
 func cloneWindow(window *quota.Window) *quota.Window {
