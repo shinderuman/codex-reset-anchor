@@ -21,11 +21,12 @@ import (
 const Version = "0.4.0"
 
 type config struct {
-	codexPath   string
-	statePath   string
-	pollEvery   time.Duration
-	prompt      string
-	anchorModel string
+	codexPath     string
+	statePath     string
+	pollEvery     time.Duration
+	prompt        string
+	anchorModel   string
+	anchorTimeout time.Duration
 }
 
 type quotaReader interface {
@@ -33,7 +34,7 @@ type quotaReader interface {
 }
 
 type anchorRunner interface {
-	RunAnchor(context.Context, string, string, string) error
+	RunAnchor(context.Context, string, string, string, time.Duration) error
 }
 
 func Run() error {
@@ -60,11 +61,15 @@ func parseConfig(args []string, home string) (config, error) {
 	flags.DurationVar(&cfg.pollEvery, "interval", 5*time.Minute, "利用枠の確認間隔")
 	flags.StringVar(&cfg.prompt, "prompt", "Reply only: OK", "アンカー用プロンプト")
 	flags.StringVar(&cfg.anchorModel, "model", "", "アンカー実行に使うモデル。空ならCodex既定値")
+	flags.DurationVar(&cfg.anchorTimeout, "anchor-timeout", 2*time.Minute, "アンカー実行のタイムアウト")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
 	}
 	if cfg.pollEvery < time.Minute {
 		return config{}, errors.New("確認間隔は1分以上にしてください")
+	}
+	if cfg.anchorTimeout <= 0 {
+		return config{}, errors.New("アンカー実行のタイムアウトは0より大きくしてください")
 	}
 	return cfg, nil
 }
@@ -121,7 +126,7 @@ func processCurrentSnapshot(ctx context.Context, cfg config, current quota.Snaps
 	}
 
 	log.Printf("利用枠の回復を検知しました: %s", strings.Join(recovered, ","))
-	if err := anchor.RunAnchor(ctx, filepath.Dir(cfg.statePath), cfg.prompt, cfg.anchorModel); err != nil {
+	if err := anchor.RunAnchor(ctx, filepath.Dir(cfg.statePath), cfg.prompt, cfg.anchorModel, cfg.anchorTimeout); err != nil {
 		return fmt.Errorf("アンカー実行に失敗しました: %w", err)
 	}
 	if err := state.Save(cfg.statePath, next); err != nil {
