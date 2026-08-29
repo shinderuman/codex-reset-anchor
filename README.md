@@ -9,10 +9,11 @@ Codex の 5 時間利用枠と週次利用枠（レートリミット）が回�
 1. 指定間隔（既定: 5 分）ごとに `codex app-server` を起動し、`initialize` ハンドシェイクを行います。
 2. `account/rateLimits/read` で現在の利用枠を取得し、app-server を終了します。
 3. `windowDurationMins` から 300 分の 5 時間枠と 10080 分の週次枠を識別します。`primary` / `secondary` の位置には依存しません。
-4. 5 時間枠と週次枠を独立して監視します。前回取得した `resetsAt` を実時間が通過し、現在の利用率が 1.0% 以下で、かつ次回 `resetsAt` が 2 分以上先へ進んだ場合に「回復」と判定します。
-5. どちらか一方または両方の回復を検知すると `codex exec` でアンカー用プロンプトを 1 件だけ実行します。同じ poll で両方が回復しても anchor は 1 回です。
-6. anchor 成功後は、その poll で実際に観測した quota を次回判定の基準として保存します。anchor による `resetsAt` の移動だけで再度回復扱いにはなりません。
-7. 状態は state file に保存します。version 2 および 0.2.x 以前の単一 window state は起動時に現行形式へ自動移行します。
+4. 5 時間枠と週次枠を独立して監視します。前回取得した `resetsAt` を実時間が通過し、かつ次回 `resetsAt` が 2 分以上先へ進んだ場合に「回復」と判定します。リセット後の利用率には依存しないため、次回 poll までに Codex を使っていてもリセットを取り逃がしません。
+5. `resetsAt` や `limitId` が一時的に欠落した poll では、同一 duration の window に対して最後に確認できた値を保持し、後続 poll でリセットを確定できるようにします。
+6. どちらか一方または両方の回復を検知すると `codex exec` でアンカー用プロンプトを 1 件だけ実行します。同じ poll で両方が回復しても anchor は 1 回です。
+7. anchor 成功後は、その poll で観測した quota を次回判定の基準として保存します。新しい `resetsAt` を次回境界として保持するため、anchor 後の小さな時刻変動だけで再度回復扱いにはなりません。
+8. 状態は state file に保存します。version 2 および 0.2.x 以前の単一 window state は起動時に現行形式へ自動移行します。
 
 anchor 実行に失敗した場合は state を進めず、次回 poll で再試行できる状態を保持します。
 
@@ -104,7 +105,7 @@ internal/state/                 state file の読み書き・migration
 }
 ```
 
-`windowName` は観測情報として保存しますが、window の同一性判定には使いません。そのため Codex 側で 5 時間枠と週次枠の `primary` / `secondary` 配置が変わっても、同じ duration の枠として追跡を継続します。
+`windowName` は観測情報として保存しますが、window の同一性判定には使いません。そのため Codex 側で 5 時間枠と週次枠の `primary` / `secondary` 配置が変わっても、同じ duration の枠として追跡を継続します。`limitId` が片方の poll で欠落した場合も、同じ duration であれば既知の ID を保持します。
 
 ## ライセンス
 
