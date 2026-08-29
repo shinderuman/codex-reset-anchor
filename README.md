@@ -49,6 +49,7 @@ go vet ./...
 | `-interval` | `5m` | 利用枠の確認間隔（1 分以上） |
 | `-prompt` | `Reply only: OK` | アンカー実行に使うプロンプト |
 | `-model` | （空） | アンカー実行に使うモデル。空なら Codex 既定値 |
+| `-anchor-timeout` | `2m` | アンカー実行のタイムアウト |
 
 ### 実行例
 
