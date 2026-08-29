@@ -100,7 +100,7 @@ func (c *Client) ReadQuotas(ctx context.Context) (quota.Snapshot, error) {
 	return server.readQuotas(ctx)
 }
 
-func (c *Client) RunAnchor(ctx context.Context, workDirectory, prompt, model string) error {
+func (c *Client) RunAnchor(ctx context.Context, workDirectory, prompt, model string, timeout time.Duration) error {
 	if err := os.MkdirAll(workDirectory, 0o755); err != nil {
 		return fmt.Errorf("アンカー実行用ディレクトリを作成できません: %w", err)
 	}
@@ -121,8 +121,21 @@ func (c *Client) RunAnchor(ctx context.Context, workDirectory, prompt, model str
 	}
 	args = append(args, prompt)
 
+	anchorCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, c.path, args...)
+	cmd := exec.CommandContext(anchorCtx, c.path, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
 	cmd.Dir = workDirectory
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
@@ -130,6 +143,15 @@ func (c *Client) RunAnchor(ctx context.Context, workDirectory, prompt, model str
 
 	if err := cmd.Run(); err != nil {
 		message := strings.TrimSpace(stderr.String())
+		if errors.Is(anchorCtx.Err(), context.DeadlineExceeded) {
+			if message == "" {
+				return fmt.Errorf("codex execがタイムアウトしました: timeout=%s", timeout)
+			}
+			return fmt.Errorf("codex execがタイムアウトしました: timeout=%s\n%s", timeout, message)
+		}
+		if anchorCtx.Err() != nil {
+			return anchorCtx.Err()
+		}
 		if message == "" {
 			return fmt.Errorf("codex execが失敗しました: %w", err)
 		}
