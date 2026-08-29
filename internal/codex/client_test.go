@@ -65,7 +65,7 @@ printf 'discarded stderr\n' >&2
 
 	client := New(scriptPath, "test")
 	workDirectory := filepath.Join(dir, "state")
-	if err := client.RunAnchor(context.Background(), workDirectory, "Reply only: OK", "test-model"); err != nil {
+	if err := client.RunAnchor(context.Background(), workDirectory, "Reply only: OK", "test-model", 2*time.Second); err != nil {
 		t.Fatalf("anchorに失敗した: %v", err)
 	}
 
@@ -98,8 +98,25 @@ func TestRunAnchorReturnsStderrOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := New(scriptPath, "test").RunAnchor(context.Background(), dir, "Reply only: OK", "")
+	err := New(scriptPath, "test").RunAnchor(context.Background(), dir, "Reply only: OK", "", 2*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "anchor failed") || !strings.Contains(err.Error(), "exit status 2") {
 		t.Fatalf("失敗内容が不正: %v", err)
+	}
+}
+
+func TestRunAnchorTimesOut(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "codex")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nsleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	err := New(scriptPath, "test").RunAnchor(context.Background(), dir, "Reply only: OK", "", 100*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "タイムアウト") {
+		t.Fatalf("timeoutエラーにならなかった: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("timeout後もcodex execが長時間終了しなかった: %s", elapsed)
 	}
 }
