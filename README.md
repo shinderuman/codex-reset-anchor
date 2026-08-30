@@ -18,6 +18,21 @@ Codex の 5 時間利用枠と週次利用枠（レートリミット）が回�
 
 anchor 実行に失敗した場合は state を進めず、次回 poll で再試行できる状態を保持します。
 
+## Anchor のトークン節約
+
+Anchor 用の `codex exec` は通常の Codex 作業コンテキストを持ち込まないように実行します。
+
+- `--ephemeral` でセッションを永続化しません。
+- `--ignore-user-config` で通常作業用の `$CODEX_HOME/config.toml` を読み込まず、認証情報だけを通常の `CODEX_HOME` から利用します。
+- `--ignore-rules` で user/project execpolicy rules を読み込みません。
+- 既定モデルは `gpt-5.6-luna`、reasoning effort と verbosity は `low` に固定します。`-model` でモデルだけ変更できます。
+- Codex の標準 base instructions は短い Anchor 専用 instructions で置き換えます。
+- permissions / apps / collaboration mode / environment context / skills の model-visible instructions を無効化します。
+- bundled skills と web search を無効化します。
+- `project_doc_max_bytes=0` として project の `AGENTS.md` を Anchor prompt に含めません。
+
+Codex CLI が標準で持つ core tool definitions までは公開 CLI から完全には無効化できないため、それらは残ります。また `$CODEX_HOME/AGENTS.md` / `AGENTS.override.md` は認証用 `CODEX_HOME` と同じ場所から読み込まれるため、このツールでは分離しません。
+
 ## 必要環境
 
 - Go 1.25.5 以上
@@ -50,7 +65,7 @@ go vet ./...
 | `-state` | `~/.local/var/codex-reset-anchor/state.json` | 状態ファイルのパス |
 | `-interval` | `5m` | 利用枠の確認間隔（1 分以上） |
 | `-prompt` | `Reply only: OK` | アンカー実行に使うプロンプト |
-| `-model` | （空） | アンカー実行に使うモデル。空なら Codex 既定値 |
+| `-model` | `gpt-5.6-luna`（実効既定値） | アンカー実行に使うモデル |
 | `-anchor-timeout` | `2m` | アンカー実行のタイムアウト |
 
 ### 実行例
@@ -63,7 +78,7 @@ go vet ./...
 ./codex-reset-anchor -interval 10m
 
 # アンカー用モデルを明示指定
-./codex-reset-anchor -model gpt-5
+./codex-reset-anchor -model gpt-5.6-terra
 ```
 
 終了は `Ctrl+C`（SIGINT）または SIGTERM です。
