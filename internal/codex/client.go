@@ -24,6 +24,7 @@ const (
 	rpcInitializeTimeout = 8 * time.Second
 	rpcRequestTimeout    = 15 * time.Second
 	rpcShutdownGrace     = 500 * time.Millisecond
+	defaultAnchorModel   = "gpt-5.6-luna"
 )
 
 type Client struct {
@@ -104,22 +105,48 @@ func (c *Client) RunAnchor(ctx context.Context, workDirectory, prompt, model str
 	if err := os.MkdirAll(workDirectory, 0o755); err != nil {
 		return fmt.Errorf("アンカー実行用ディレクトリを作成できません: %w", err)
 	}
+	if model == "" {
+		model = defaultAnchorModel
+	}
 
 	args := []string{
 		"--ask-for-approval",
 		"never",
 		"exec",
 		"--ephemeral",
+		"--ignore-user-config",
+		"--ignore-rules",
 		"--skip-git-repo-check",
 		"--sandbox",
 		"read-only",
 		"--color",
 		"never",
+		"--model",
+		model,
+		"-c",
+		`model_reasoning_effort="low"`,
+		"-c",
+		`model_verbosity="low"`,
+		"-c",
+		`instructions="Answer briefly. Do not use tools."`,
+		"-c",
+		"include_permissions_instructions=false",
+		"-c",
+		"include_apps_instructions=false",
+		"-c",
+		"include_collaboration_mode_instructions=false",
+		"-c",
+		"include_environment_context=false",
+		"-c",
+		"skills.include_instructions=false",
+		"-c",
+		"skills.bundled.enabled=false",
+		"-c",
+		`web_search="disabled"`,
+		"-c",
+		"project_doc_max_bytes=0",
+		prompt,
 	}
-	if model != "" {
-		args = append(args, "--model", model)
-	}
-	args = append(args, prompt)
 
 	anchorCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
