@@ -75,8 +75,20 @@ printf 'discarded stderr\n' >&2
 	}
 	actual := strings.Split(strings.TrimSuffix(string(argumentsData), "\n"), "\n")
 	expected := []string{
-		"--ask-for-approval", "never", "exec", "--ephemeral", "--skip-git-repo-check",
-		"--sandbox", "read-only", "--color", "never", "--model", "test-model", "Reply only: OK",
+		"--ask-for-approval", "never", "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+		"--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--model", "test-model",
+		"-c", `model_reasoning_effort="low"`,
+		"-c", `model_verbosity="low"`,
+		"-c", `instructions="Answer briefly. Do not use tools."`,
+		"-c", "include_permissions_instructions=false",
+		"-c", "include_apps_instructions=false",
+		"-c", "include_collaboration_mode_instructions=false",
+		"-c", "include_environment_context=false",
+		"-c", "skills.include_instructions=false",
+		"-c", "skills.bundled.enabled=false",
+		"-c", `web_search="disabled"`,
+		"-c", "project_doc_max_bytes=0",
+		"Reply only: OK",
 	}
 	if !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("引数が不正:\n got=%q\nwant=%q", actual, expected)
@@ -89,6 +101,37 @@ printf 'discarded stderr\n' >&2
 	if strings.TrimSpace(string(workingDirectoryData)) != workDirectory {
 		t.Fatalf("working directoryが不正: %q", workingDirectoryData)
 	}
+}
+
+func TestRunAnchorDefaultsToLuna(t *testing.T) {
+	dir := t.TempDir()
+	argumentsPath := filepath.Join(dir, "arguments.txt")
+	scriptPath := filepath.Join(dir, "codex")
+	script := `#!/bin/sh
+printf '%s\n' "$@" > "$CODEX_TEST_ARGUMENTS"
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_TEST_ARGUMENTS", argumentsPath)
+
+	if err := New(scriptPath, "test").RunAnchor(context.Background(), dir, "Reply only: OK", "", 2*time.Second); err != nil {
+		t.Fatalf("anchorに失敗した: %v", err)
+	}
+	argumentsData, err := os.ReadFile(argumentsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments := strings.Split(strings.TrimSuffix(string(argumentsData), "\n"), "\n")
+	for i := 0; i+1 < len(arguments); i++ {
+		if arguments[i] == "--model" {
+			if arguments[i+1] != defaultAnchorModel {
+				t.Fatalf("default modelが不正: %q", arguments[i+1])
+			}
+			return
+		}
+	}
+	t.Fatalf("--modelがない: %q", arguments)
 }
 
 func TestRunAnchorReturnsStderrOnFailure(t *testing.T) {

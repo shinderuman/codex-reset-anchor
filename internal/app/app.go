@@ -60,7 +60,7 @@ func parseConfig(args []string, home string) (config, error) {
 	flags.StringVar(&cfg.statePath, "state", filepath.Join(home, ".local", "var", "codex-reset-anchor", "state.json"), "状態ファイルのパス")
 	flags.DurationVar(&cfg.pollEvery, "interval", 5*time.Minute, "利用枠の確認間隔")
 	flags.StringVar(&cfg.prompt, "prompt", "Reply only: OK", "アンカー用プロンプト")
-	flags.StringVar(&cfg.anchorModel, "model", "", "アンカー実行に使うモデル。空ならCodex既定値")
+	flags.StringVar(&cfg.anchorModel, "model", "", "アンカー実行に使うモデル。空ならgpt-5.6-luna")
 	flags.DurationVar(&cfg.anchorTimeout, "anchor-timeout", 2*time.Minute, "アンカー実行のタイムアウト")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
