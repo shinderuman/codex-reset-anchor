@@ -1,9 +1,10 @@
-package app
+package monitor
 
 import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -39,7 +40,7 @@ func window(duration int64, used float64, resetsAt int64, checkedAt time.Time) *
 
 func TestProcessSnapshotDoesNotRepeatAnchorWhenAnchorMovesResetBoundary(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	cfg := config{statePath: statePath, prompt: "Reply only: OK"}
+	cfg := Config{StatePath: statePath, Prompt: "Reply only: OK"}
 	anchor := &fakeAnchor{}
 	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
 
@@ -53,7 +54,7 @@ func TestProcessSnapshotDoesNotRepeatAnchorWhenAnchorMovesResetBoundary(t *testi
 	first := quota.Snapshot{
 		FiveHour: window(quota.FiveHourWindowMinutes, 0, resetAt.Add(5*time.Hour).Unix(), resetAt.Add(time.Minute)),
 	}
-	if err := processCurrentSnapshot(context.Background(), cfg, first, anchor); err != nil {
+	if err := newTestMonitor(cfg, anchor).processSnapshot(context.Background(), first); err != nil {
 		t.Fatalf("最初のreset処理に失敗した: %v", err)
 	}
 	if anchor.calls != 1 {
@@ -63,7 +64,7 @@ func TestProcessSnapshotDoesNotRepeatAnchorWhenAnchorMovesResetBoundary(t *testi
 	second := quota.Snapshot{
 		FiveHour: window(quota.FiveHourWindowMinutes, 0, resetAt.Add(5*time.Hour+5*time.Minute).Unix(), resetAt.Add(6*time.Minute)),
 	}
-	if err := processCurrentSnapshot(context.Background(), cfg, second, anchor); err != nil {
+	if err := newTestMonitor(cfg, anchor).processSnapshot(context.Background(), second); err != nil {
 		t.Fatalf("次poll処理に失敗した: %v", err)
 	}
 	if anchor.calls != 1 {
@@ -73,7 +74,7 @@ func TestProcessSnapshotDoesNotRepeatAnchorWhenAnchorMovesResetBoundary(t *testi
 
 func TestSimultaneousResetsRunSingleAnchor(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	cfg := config{statePath: statePath, prompt: "Reply only: OK"}
+	cfg := Config{StatePath: statePath, Prompt: "Reply only: OK"}
 	anchor := &fakeAnchor{}
 	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
 	previous := state.Monitor{
@@ -88,7 +89,7 @@ func TestSimultaneousResetsRunSingleAnchor(t *testing.T) {
 		Weekly:   window(quota.WeeklyWindowMinutes, 0, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute)),
 	}
 
-	if err := processCurrentSnapshot(context.Background(), cfg, current, anchor); err != nil {
+	if err := newTestMonitor(cfg, anchor).processSnapshot(context.Background(), current); err != nil {
 		t.Fatalf("reset処理に失敗した: %v", err)
 	}
 	if anchor.calls != 1 {
@@ -96,9 +97,92 @@ func TestSimultaneousResetsRunSingleAnchor(t *testing.T) {
 	}
 }
 
+func TestResetLogsRemainingQuotas(t *testing.T) {
+	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
+	previousFiveHour := window(quota.FiveHourWindowMinutes, 80, resetAt.Unix(), resetAt.Add(-time.Minute))
+	previousWeekly := window(quota.WeeklyWindowMinutes, 65, resetAt.Unix(), resetAt.Add(-time.Minute))
+	resetFiveHour := window(quota.FiveHourWindowMinutes, 0, resetAt.Add(5*time.Hour).Unix(), resetAt.Add(time.Minute))
+	resetWeekly := window(quota.WeeklyWindowMinutes, 17, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute))
+	activeFiveHour := window(quota.FiveHourWindowMinutes, 82.5, resetAt.Unix(), resetAt.Add(time.Minute))
+	activeWeekly := window(quota.WeeklyWindowMinutes, 67, resetAt.Unix(), resetAt.Add(time.Minute))
+
+	tests := []struct {
+		name     string
+		previous state.Monitor
+		current  quota.Snapshot
+		before   string
+		after    string
+	}{
+		{
+			name:     "5h reset",
+			previous: state.Monitor{FiveHour: previousFiveHour, Weekly: previousWeekly},
+			current:  quota.Snapshot{FiveHour: resetFiveHour, Weekly: activeWeekly},
+			before:   "5h=20.0%, weekly=35.0%",
+			after:    "5h=100.0%, weekly=33.0%",
+		},
+		{
+			name:     "weekly reset with anchor skipped",
+			previous: state.Monitor{FiveHour: previousFiveHour, Weekly: previousWeekly},
+			current:  quota.Snapshot{FiveHour: activeFiveHour, Weekly: resetWeekly},
+			before:   "5h=20.0%, weekly=35.0%",
+			after:    "5h=17.5%, weekly=83.0%",
+		},
+		{
+			name:     "simultaneous resets",
+			previous: state.Monitor{FiveHour: previousFiveHour, Weekly: previousWeekly},
+			current:  quota.Snapshot{FiveHour: resetFiveHour, Weekly: resetWeekly},
+			before:   "5h=20.0%, weekly=35.0%",
+			after:    "5h=100.0%, weekly=83.0%",
+		},
+		{
+			name:     "missing current weekly does not report stale value",
+			previous: state.Monitor{FiveHour: previousFiveHour, Weekly: previousWeekly},
+			current:  quota.Snapshot{FiveHour: resetFiveHour},
+			before:   "5h=20.0%, weekly=35.0%",
+			after:    "5h=100.0%, weekly=不明",
+		},
+		{
+			name:     "missing previous 5h",
+			previous: state.Monitor{Weekly: previousWeekly},
+			current:  quota.Snapshot{FiveHour: activeFiveHour, Weekly: resetWeekly},
+			before:   "5h=不明, weekly=35.0%",
+			after:    "5h=17.5%, weekly=83.0%",
+		},
+		{
+			name:     "missing weekly",
+			previous: state.Monitor{FiveHour: previousFiveHour},
+			current:  quota.Snapshot{FiveHour: resetFiveHour},
+			before:   "5h=20.0%, weekly=不明",
+			after:    "5h=100.0%, weekly=不明",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			statePath := filepath.Join(t.TempDir(), "state.json")
+			if err := state.Save(statePath, tt.previous); err != nil {
+				t.Fatal(err)
+			}
+			var logs bytes.Buffer
+			logger := log.New(&logs, "", 0)
+
+			if err := New(Config{StatePath: statePath}, nil, &fakeAnchor{}, logger).processSnapshot(context.Background(), tt.current); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				"前回確認時の残り利用枠: " + tt.before,
+				"リセット検知時の残り利用枠: " + tt.after,
+			} {
+				if strings.Count(logs.String(), want) != 1 {
+					t.Fatalf("残り利用枠ログが1回出力されなかった: want=%q logs=%s", want, logs.String())
+				}
+			}
+		})
+	}
+}
+
 func TestResetWithActiveUsageSkipsAnchorAndLogs(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	cfg := config{statePath: statePath, prompt: "Reply only: OK"}
+	cfg := Config{StatePath: statePath, Prompt: "Reply only: OK"}
 	anchor := &fakeAnchor{}
 	resetAt := time.Date(2026, 8, 30, 6, 30, 0, 0, time.UTC)
 	previous := state.Monitor{
@@ -112,11 +196,9 @@ func TestResetWithActiveUsageSkipsAnchorAndLogs(t *testing.T) {
 	}
 
 	var logs bytes.Buffer
-	originalWriter := log.Writer()
-	log.SetOutput(&logs)
-	defer log.SetOutput(originalWriter)
+	logger := log.New(&logs, "", 0)
 
-	if err := processCurrentSnapshot(context.Background(), cfg, current, anchor); err != nil {
+	if err := New(cfg, nil, anchor, logger).processSnapshot(context.Background(), current); err != nil {
 		t.Fatalf("weekly reset処理に失敗した: %v", err)
 	}
 	if anchor.calls != 0 {
@@ -143,7 +225,7 @@ func TestResetWithActiveUsageSkipsAnchorAndLogs(t *testing.T) {
 
 func TestSimultaneousResetsAnchorWhenAnyRecoveredWindowUnused(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	cfg := config{statePath: statePath, prompt: "Reply only: OK"}
+	cfg := Config{StatePath: statePath, Prompt: "Reply only: OK"}
 	anchor := &fakeAnchor{}
 	resetAt := time.Date(2026, 8, 30, 6, 30, 0, 0, time.UTC)
 	previous := state.Monitor{
@@ -158,7 +240,7 @@ func TestSimultaneousResetsAnchorWhenAnyRecoveredWindowUnused(t *testing.T) {
 		Weekly:   window(quota.WeeklyWindowMinutes, 17, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute)),
 	}
 
-	if err := processCurrentSnapshot(context.Background(), cfg, current, anchor); err != nil {
+	if err := newTestMonitor(cfg, anchor).processSnapshot(context.Background(), current); err != nil {
 		t.Fatalf("同時reset処理に失敗した: %v", err)
 	}
 	if anchor.calls != 1 {
@@ -168,7 +250,7 @@ func TestSimultaneousResetsAnchorWhenAnyRecoveredWindowUnused(t *testing.T) {
 
 func TestWeeklyResetSurvivesMissingBoundaryAndActiveUsage(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	cfg := config{statePath: statePath, prompt: "Reply only: OK"}
+	cfg := Config{StatePath: statePath, Prompt: "Reply only: OK"}
 	anchor := &fakeAnchor{}
 	resetAt := time.Date(2026, 8, 30, 6, 30, 0, 0, time.UTC)
 	previous := state.Monitor{
@@ -181,7 +263,7 @@ func TestWeeklyResetSurvivesMissingBoundaryAndActiveUsage(t *testing.T) {
 	sparse := quota.Snapshot{
 		Weekly: window(quota.WeeklyWindowMinutes, 17, 0, resetAt.Add(time.Minute)),
 	}
-	if err := processCurrentSnapshot(context.Background(), cfg, sparse, anchor); err != nil {
+	if err := newTestMonitor(cfg, anchor).processSnapshot(context.Background(), sparse); err != nil {
 		t.Fatalf("resetsAt欠落pollの処理に失敗した: %v", err)
 	}
 	if anchor.calls != 0 {
@@ -198,7 +280,7 @@ func TestWeeklyResetSurvivesMissingBoundaryAndActiveUsage(t *testing.T) {
 	resolved := quota.Snapshot{
 		Weekly: window(quota.WeeklyWindowMinutes, 23, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(6*time.Minute)),
 	}
-	if err := processCurrentSnapshot(context.Background(), cfg, resolved, anchor); err != nil {
+	if err := newTestMonitor(cfg, anchor).processSnapshot(context.Background(), resolved); err != nil {
 		t.Fatalf("weekly reset確定pollの処理に失敗した: %v", err)
 	}
 	if anchor.calls != 0 {
@@ -215,7 +297,7 @@ func TestWeeklyResetSurvivesMissingBoundaryAndActiveUsage(t *testing.T) {
 
 func TestFailedAnchorDoesNotAdvanceState(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	cfg := config{statePath: statePath, prompt: "Reply only: OK"}
+	cfg := Config{StatePath: statePath, Prompt: "Reply only: OK"}
 	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
 	previous := state.Monitor{
 		FiveHour: window(quota.FiveHourWindowMinutes, 100, resetAt.Unix(), resetAt.Add(-time.Minute)),
@@ -232,7 +314,7 @@ func TestFailedAnchorDoesNotAdvanceState(t *testing.T) {
 		FiveHour: window(quota.FiveHourWindowMinutes, 0, resetAt.Add(5*time.Hour).Unix(), resetAt.Add(time.Minute)),
 	}
 	anchor := &fakeAnchor{err: errors.New("failed")}
-	if err := processCurrentSnapshot(context.Background(), cfg, current, anchor); err == nil {
+	if err := newTestMonitor(cfg, anchor).processSnapshot(context.Background(), current); err == nil {
 		t.Fatal("anchor失敗が成功扱いになった")
 	}
 	after, err := os.ReadFile(statePath)
@@ -244,25 +326,6 @@ func TestFailedAnchorDoesNotAdvanceState(t *testing.T) {
 	}
 }
 
-func TestParseConfigDefaultsAndValidation(t *testing.T) {
-	cfg, err := parseConfig(nil, "/tmp/home")
-	if err != nil {
-		t.Fatalf("default configを解析できなかった: %v", err)
-	}
-	if cfg.pollEvery != 5*time.Minute || cfg.prompt != "Reply only: OK" || cfg.codexPath != "codex" {
-		t.Fatalf("default configが不正: %+v", cfg)
-	}
-	if cfg.statePath != "/tmp/home/.local/var/codex-reset-anchor/state.json" {
-		t.Fatalf("default state pathが不正: %s", cfg.statePath)
-	}
-	if _, err := parseConfig([]string{"-interval", "30s"}, "/tmp/home"); err == nil {
-		t.Fatal("1分未満のintervalを許可した")
-	}
-}
-
-func TestParseConfigRejectsInvalidAnchorTimeout(t *testing.T) {
-	_, err := parseConfig([]string{"-anchor-timeout", "0s"}, t.TempDir())
-	if err == nil {
-		t.Fatal("0秒のanchor timeoutを受理した")
-	}
+func newTestMonitor(cfg Config, anchor AnchorRunner) *Monitor {
+	return New(cfg, nil, anchor, log.New(io.Discard, "", 0))
 }

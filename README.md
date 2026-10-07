@@ -18,6 +18,16 @@ Codex の 5 時間利用枠と週次利用枠（レートリミット）が回�
 
 anchor 実行に失敗した場合は state を進めず、次回 poll で再試行できる状態を保持します。
 
+5 時間枠・週次枠のどちらがリセットしても、前回確認時とリセット検知時の両方について、5h と weekly の残り利用率をログへ出力します。残り利用率は `100 - usedPercent`（0〜100%）です。アンカーをスキップする場合や実行に失敗した場合も出力します。
+
+```text
+利用枠の回復を検知しました: 5h
+前回確認時の残り利用枠: 5h=20.0%, weekly=35.0%
+リセット検知時の残り利用枠: 5h=100.0%, weekly=33.0%
+```
+
+定期確認のため、前回確認時の値は保存済みの最終確認値であり、リセット時刻ちょうどの残量ではありません。取得できていない枠は `不明` と表示します。リセット検知時の値には、その回の取得値を使います。
+
 ## Anchor のトークン節約
 
 Anchor 用の `codex exec` は通常の Codex 作業コンテキストを持ち込まないように実行します。
@@ -87,13 +97,14 @@ go vet ./...
 
 ```text
 cmd/codex-reset-anchor/main.go  CLI entry point
-internal/app/                   設定・監視ループ・ユースケース
+internal/app/                   起動・CLI 設定・依存の組み立て
+internal/monitor/               監視ループ・アンカー実行・ログ出力
 internal/codex/                 codex app-server / exec 連携
-internal/quota/                 quota と回復判定
+internal/quota/                 quota・観測値の補完・回復判定
 internal/state/                 state file の読み書き・migration
 ```
 
-`cmd/codex-reset-anchor/main.go` は起動処理だけを持ち、実装は `internal/` 配下へ分離しています。
+`cmd/codex-reset-anchor/main.go` は entry point です。`internal/app/app.go` は設定の読み込み、終了シグナルの設定、依存の組み立てだけを担当します。`internal/monitor/` は監視ループ（`monitor.go`）、状態保存とアンカー実行（`processor.go`）、ログ整形（`log.go`）を分離しています。欠落値の補完と回復した枠の判定は `internal/quota/observation.go` に置き、ファイルやログに依存しない処理として扱います。
 
 ## state file
 
