@@ -55,7 +55,10 @@ func (m *Monitor) poll(ctx context.Context) {
 		m.logger.Printf("利用枠の取得に失敗しました: %v", err)
 		return
 	}
-	if err := m.processSnapshot(ctx, current); err != nil {
+	result, err := m.processSnapshot(ctx, current)
+	if result != nil {
+		m.logReset(result, err)
+	} else if err != nil {
 		m.logger.Printf("利用枠の処理に失敗しました: %v", err)
 	}
 }
