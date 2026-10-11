@@ -23,7 +23,7 @@ func (f readerFunc) ReadQuotas(ctx context.Context) (quota.Snapshot, error) {
 
 func TestRunPollsImmediatelyAndStopsOnCancellation(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	current := quota.Snapshot{FiveHour: window(quota.FiveHourWindowMinutes, 25, 1000, time.Unix(900, 0))}
+	current := quota.Snapshot{FiveHour: window(quota.FiveHourWindowMinutes, 25, 1000)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	calls := 0

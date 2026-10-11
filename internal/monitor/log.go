@@ -7,12 +7,17 @@ import (
 	"github.com/shinderuman/codex-reset-anchor/internal/quota"
 )
 
-func (m *Monitor) logReset(result *resetResult, err error) {
-	recovered := make([]string, 0, len(result.windows))
-	for _, recoveredWindow := range result.windows {
-		recovered = append(recovered, recoveredWindow.Name)
+func resetLog(changed []string, previous quota.Snapshot, status string) string {
+	return fmt.Sprintf("reset=%s prev=%s/%s anchor=%s", strings.Join(changed, ","), remainingPercent(previous.FiveHour), remainingPercent(previous.Weekly), status)
+}
+
+func (m *Monitor) logResult(message string, err error) {
+	if message == "" {
+		if err != nil {
+			m.logger.Printf("利用枠の処理に失敗しました: %v", err)
+		}
+		return
 	}
-	message := fmt.Sprintf("reset=%s prev=%s/%s anchor=%s", strings.Join(recovered, ","), remainingPercent(result.previous.FiveHour), remainingPercent(result.previous.Weekly), result.anchor)
 	if err != nil {
 		message += fmt.Sprintf(" err=%q", err.Error())
 	}
@@ -23,5 +28,5 @@ func remainingPercent(window *quota.Window) string {
 	if window == nil {
 		return "-"
 	}
-	return fmt.Sprintf("%.0f%%", max(0, min(100, 100-window.UsedPercent)))
+	return fmt.Sprintf("%.0f%%", 100-window.UsedPercent)
 }

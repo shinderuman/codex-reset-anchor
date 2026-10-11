@@ -1,78 +1,48 @@
 package quota
 
-import (
-	"testing"
-	"time"
-)
+import "testing"
 
-func testWindow(duration int64, used float64, resetsAt int64, checkedAt time.Time) Window {
-	return Window{
-		LimitID:           "codex",
-		WindowName:        "primary",
-		WindowDurationMin: duration,
-		UsedPercent:       used,
-		ResetsAt:          resetsAt,
-		CheckedAt:         checkedAt.UnixNano(),
-	}
+func testWindow(duration int64, used float64, resetsAt int64) Window {
+	return Window{LimitID: "codex", WindowDurationMin: duration, UsedPercent: used, ResetsAt: resetsAt}
 }
 
-func TestRecoveredWhenKnownResetBoundaryElapsed(t *testing.T) {
-	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
-	previous := testWindow(FiveHourWindowMinutes, 0, resetAt.Unix(), resetAt.Add(-time.Minute))
-	current := testWindow(FiveHourWindowMinutes, 0, resetAt.Add(5*time.Hour).Unix(), resetAt.Add(time.Minute))
-
-	if !Recovered(previous, current) {
-		t.Fatal("既知のリセット時刻を通過したwindowを回復として検知できなかった")
+func TestChanged(t *testing.T) {
+	w := func(duration int64, used float64, reset int64) *Window {
+		window := testWindow(duration, used, reset)
+		return &window
 	}
-}
-
-func TestRecoveredAfterResetEvenWhenQuotaAlreadyUsed(t *testing.T) {
-	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
-	previous := testWindow(WeeklyWindowMinutes, 92, resetAt.Unix(), resetAt.Add(-time.Minute))
-	current := testWindow(WeeklyWindowMinutes, 17, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute))
-
-	if !Recovered(previous, current) {
-		t.Fatal("リセット後に利用が進んだweekly windowを回復として検知できなかった")
-	}
-}
-
-func TestBoundaryMoveBeforeResetDoesNotRecover(t *testing.T) {
-	resetAt := time.Date(2026, 8, 29, 18, 0, 0, 0, time.UTC)
-	previous := testWindow(FiveHourWindowMinutes, 0, resetAt.Unix(), resetAt.Add(-4*time.Hour))
-	current := testWindow(FiveHourWindowMinutes, 0, resetAt.Add(5*time.Minute).Unix(), resetAt.Add(-4*time.Hour+5*time.Minute))
-
-	if Recovered(previous, current) {
-		t.Fatal("リセット前のresetsAt移動を回復として誤検知した")
-	}
-}
-
-func TestSmallBoundaryJitterDoesNotRecover(t *testing.T) {
-	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
-	previous := testWindow(WeeklyWindowMinutes, 100, resetAt.Unix(), resetAt.Add(-time.Minute))
-	current := testWindow(WeeklyWindowMinutes, 0, resetAt.Add(time.Minute).Unix(), resetAt.Add(time.Minute))
-
-	if Recovered(previous, current) {
-		t.Fatal("小さな境界差を回復として誤検知した")
-	}
-}
-
-func TestMissingLimitIDStillMatchesSameDurationWindow(t *testing.T) {
-	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
-	previous := testWindow(WeeklyWindowMinutes, 90, resetAt.Unix(), resetAt.Add(-time.Minute))
-	current := testWindow(WeeklyWindowMinutes, 0, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute))
-	current.LimitID = ""
-
-	if !Recovered(previous, current) {
-		t.Fatal("limitIdが一時欠落した同一duration windowを別windowとして扱った")
-	}
-}
-
-func TestWindowIdentityChangeDoesNotRecover(t *testing.T) {
-	resetAt := time.Date(2026, 8, 29, 13, 0, 0, 0, time.UTC)
-	previous := testWindow(FiveHourWindowMinutes, 100, resetAt.Unix(), resetAt.Add(-time.Minute))
-	current := testWindow(WeeklyWindowMinutes, 0, resetAt.Add(7*24*time.Hour).Unix(), resetAt.Add(time.Minute))
-
-	if Recovered(previous, current) {
-		t.Fatal("異なるwindowを同一resetとして扱った")
+	differentID := w(WeeklyWindowMinutes, 0, 2000)
+	differentID.LimitID = "other"
+	missingID := w(WeeklyWindowMinutes, 0, 2000)
+	missingID.LimitID = ""
+	for _, tt := range []struct {
+		name              string
+		previous, current *Window
+		want              bool
+	}{
+		{"absent", nil, nil, false},
+		{"initial observation", nil, w(WeeklyWindowMinutes, 0, 1000), false},
+		{"missing window", w(WeeklyWindowMinutes, 74, 1000), nil, false},
+		{"usage change only", w(WeeklyWindowMinutes, 74, 1000), w(WeeklyWindowMinutes, 0, 1000), false},
+		{"5h later by one second", w(FiveHourWindowMinutes, 0, 1000), w(FiveHourWindowMinutes, 0, 1001), false},
+		{"5h earlier by one second", w(FiveHourWindowMinutes, 0, 1000), w(FiveHourWindowMinutes, 0, 999), false},
+		{"weekly later by one second", w(WeeklyWindowMinutes, 0, 1000), w(WeeklyWindowMinutes, 17, 1001), false},
+		{"weekly earlier by one second", w(WeeklyWindowMinutes, 0, 1000), w(WeeklyWindowMinutes, 17, 999), false},
+		{"5h same minute", w(FiveHourWindowMinutes, 0, 960), w(FiveHourWindowMinutes, 0, 1019), false},
+		{"weekly same minute", w(WeeklyWindowMinutes, 0, 1019), w(WeeklyWindowMinutes, 17, 960), false},
+		{"5h next minute", w(FiveHourWindowMinutes, 0, 1019), w(FiveHourWindowMinutes, 0, 1020), true},
+		{"5h previous minute", w(FiveHourWindowMinutes, 0, 1020), w(FiveHourWindowMinutes, 0, 1019), true},
+		{"weekly next minute", w(WeeklyWindowMinutes, 0, 1019), w(WeeklyWindowMinutes, 17, 1020), true},
+		{"weekly previous minute", w(WeeklyWindowMinutes, 0, 1020), w(WeeklyWindowMinutes, 17, 1019), true},
+		{"observed weekly reset", w(WeeklyWindowMinutes, 74, 1791948708), w(WeeklyWindowMinutes, 0, 1792301252), true},
+		{"different duration", w(FiveHourWindowMinutes, 74, 1000), w(WeeklyWindowMinutes, 0, 2000), false},
+		{"different ID", w(WeeklyWindowMinutes, 74, 1000), differentID, false},
+		{"missing ID is not inferred", w(WeeklyWindowMinutes, 74, 1000), missingID, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Changed(tt.previous, tt.current); got != tt.want {
+				t.Fatalf("Changed=%v, want %v", got, tt.want)
+			}
+		})
 	}
 }

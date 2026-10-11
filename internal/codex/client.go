@@ -28,8 +28,7 @@ const (
 )
 
 type Client struct {
-	path    string
-	version string
+	path string
 }
 
 type rpcMessage struct {
@@ -53,14 +52,11 @@ type rateLimitWindow struct {
 }
 
 type rateLimitBucket struct {
-	LimitID   string           `json:"limitId"`
-	LimitName *string          `json:"limitName"`
 	Primary   *rateLimitWindow `json:"primary"`
 	Secondary *rateLimitWindow `json:"secondary"`
 }
 
 type rateLimitsResult struct {
-	RateLimits          *rateLimitBucket           `json:"rateLimits"`
 	RateLimitsByLimitID map[string]rateLimitBucket `json:"rateLimitsByLimitId"`
 }
 
@@ -83,8 +79,8 @@ type appServer struct {
 	stderr   bytes.Buffer
 }
 
-func New(path, version string) *Client {
-	return &Client{path: path, version: version}
+func New(path string) *Client {
+	return &Client{path: path}
 }
 
 func (c *Client) ReadQuotas(ctx context.Context) (quota.Snapshot, error) {
@@ -94,7 +90,7 @@ func (c *Client) ReadQuotas(ctx context.Context) (quota.Snapshot, error) {
 	}
 	defer server.close()
 
-	if err := server.initialize(ctx, c.version); err != nil {
+	if err := server.initialize(ctx); err != nil {
 		return quota.Snapshot{}, err
 	}
 
@@ -221,12 +217,12 @@ func startAppServer(ctx context.Context, path string) (*appServer, error) {
 	return server, nil
 }
 
-func (s *appServer) initialize(ctx context.Context, version string) error {
+func (s *appServer) initialize(ctx context.Context) error {
 	params := map[string]any{
 		"clientInfo": map[string]string{
 			"name":    clientName,
 			"title":   clientTitle,
-			"version": version,
+			"version": "",
 		},
 	}
 	if _, err := s.call(ctx, "initialize", params, rpcInitializeTimeout); err != nil {
@@ -249,59 +245,40 @@ func (s *appServer) readQuotas(ctx context.Context) (quota.Snapshot, error) {
 		return quota.Snapshot{}, fmt.Errorf("レート制限レスポンスを解析できません: %w", err)
 	}
 
-	snapshot := selectQuotaSnapshot(limits, time.Now())
+	snapshot := selectQuotaSnapshot(limits)
 	if snapshot.FiveHour == nil && snapshot.Weekly == nil {
 		return quota.Snapshot{}, errors.New("5時間または週次相当のレート制限ウィンドウが見つかりません")
 	}
 	return snapshot, nil
 }
 
-func selectQuotaSnapshot(result rateLimitsResult, checkedAt time.Time) quota.Snapshot {
+func selectQuotaSnapshot(result rateLimitsResult) quota.Snapshot {
 	var selected quota.Snapshot
+	bucket := result.RateLimitsByLimitID["codex"]
 
-	consider := func(bucket rateLimitBucket, name string, window *rateLimitWindow) {
+	consider := func(name string, window *rateLimitWindow) {
 		if window == nil {
 			return
 		}
 		candidate := quota.Window{
-			LimitID:           bucket.LimitID,
+			LimitID:           "codex",
 			WindowName:        name,
 			UsedPercent:       window.UsedPercent,
 			WindowDurationMin: window.WindowDurationMin,
 			ResetsAt:          window.ResetsAt,
-			CheckedAt:         checkedAt.UnixNano(),
 		}
 
 		switch window.WindowDurationMin {
 		case quota.FiveHourWindowMinutes:
-			if selected.FiveHour == nil || preferCandidate(*selected.FiveHour, candidate) {
-				copy := candidate
-				selected.FiveHour = &copy
-			}
+			selected.FiveHour = &candidate
 		case quota.WeeklyWindowMinutes:
-			if selected.Weekly == nil || preferCandidate(*selected.Weekly, candidate) {
-				copy := candidate
-				selected.Weekly = &copy
-			}
+			selected.Weekly = &candidate
 		}
 	}
 
-	for limitID, bucket := range result.RateLimitsByLimitID {
-		if bucket.LimitID == "" {
-			bucket.LimitID = limitID
-		}
-		consider(bucket, "primary", bucket.Primary)
-		consider(bucket, "secondary", bucket.Secondary)
-	}
-	if result.RateLimits != nil {
-		consider(*result.RateLimits, "primary", result.RateLimits.Primary)
-		consider(*result.RateLimits, "secondary", result.RateLimits.Secondary)
-	}
+	consider("primary", bucket.Primary)
+	consider("secondary", bucket.Secondary)
 	return selected
-}
-
-func preferCandidate(current, candidate quota.Window) bool {
-	return current.LimitID != "codex" && candidate.LimitID == "codex"
 }
 
 func (s *appServer) call(ctx context.Context, method string, params any, timeout time.Duration) (json.RawMessage, error) {
@@ -363,7 +340,8 @@ func (s *appServer) readLoop(stdout io.Reader) {
 	for scanner.Scan() {
 		var message rpcMessage
 		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
-			continue
+			s.reportError(fmt.Errorf("app-serverのJSON解析に失敗しました: %w", err))
+			break
 		}
 		if message.ID != nil {
 			s.responses <- message

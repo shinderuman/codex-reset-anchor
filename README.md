@@ -1,22 +1,16 @@
 # Codex Reset Anchor
 
-Codex の 5 時間利用枠と週次利用枠（レートリミット）が回復したことを検知し、自動でアンカー用プロンプトを実行するツールです。
+Codex の 5 時間利用枠と週次利用枠（レートリミット）の更新を検知し、自動でアンカー用プロンプトを実行するツールです。
 
 `codex app-server` の JSON-RPC を介して利用枠を監視し、5 時間枠または週次枠のリセットを検知すると、未使用の新しい枠に対して `codex exec` で軽量なプロンプトを 1 件実行します。これにより、回復直後の枠を確保（アンカー）します。
 
 ## 動作の概要
 
-1. 指定間隔（既定: 5 分）ごとに `codex app-server` を起動し、`initialize` ハンドシェイクを行います。
-2. `account/rateLimits/read` で現在の利用枠を取得し、app-server を終了します。
-3. `windowDurationMins` から 300 分の 5 時間枠と 10080 分の週次枠を識別します。`primary` / `secondary` の位置には依存しません。
-4. 5 時間枠と週次枠を独立して監視します。前回取得した `resetsAt` を実時間が通過し、かつ次回 `resetsAt` が 2 分以上先へ進んだ場合に「回復」と判定します。リセット後の利用率には依存しないため、次回 poll までに Codex を使っていてもリセット自体は取り逃がしません。
-5. `resetsAt` や `limitId` が一時的に欠落した poll では、同一 duration の window に対して最後に確認できた値を保持し、後続 poll でリセットを確定できるようにします。
-6. 回復した枠の `usedPercent` が 0 より大きい場合は、すでに新しい枠が利用されているため追加のアンカーは行わず、ログに `anchor=skip` と出力します。
-7. 同じ poll で複数の枠が回復した場合、1 つでも `usedPercent == 0` の枠があれば `codex exec` を 1 件だけ実行します。すべての回復枠が利用済みなら実行しません。
-8. anchor 成功または利用済みによるskip後は、その poll で観測した quota を次回判定の基準として保存します。新しい `resetsAt` を次回境界として保持するため、同じリセットを再処理しません。
-9. 状態は state file に保存します。version 2 および 0.2.x 以前の単一 window state は起動時に現行形式へ自動移行します。
-
-anchor 実行に失敗した場合は state を進めず、次回 poll で再試行できる状態を保持します。
+1. 指定間隔（既定: 5 分）で `codex app-server` の `account/rateLimits/read` から利用枠を取得します。300 分の枠を 5h、10080 分の枠を weekly として識別します。
+2. 初回は比較の基準を保存します。以降は各枠の `resetsAt` を分単位で比較し、分が変われば更新として検知します。前後どちらへの変更も対象です。
+3. 更新された枠に `usedPercent == 0` の枠があればアンカーを 1 件実行します。すべて使用済みならスキップします。
+4. 成功・スキップ時は取得値を次回の基準として保存します。アンカー失敗時は基準を進めず、次回に再試行します。
+5. 更新された枠、前回の 5h / weekly 残量、アンカー結果を 1 行で出力します。
 
 5 時間枠・週次枠のどちらがリセットしても、前回確認時の残り利用率とアンカー結果を1行にまとめて出力します。残り利用率は `100 - usedPercent`（0〜100%）で、小数点なしの整数表示です。
 
@@ -100,39 +94,36 @@ cmd/codex-reset-anchor/main.go  CLI entry point
 internal/app/                   起動・CLI 設定・依存の組み立て
 internal/monitor/               監視ループ・アンカー実行・ログ出力
 internal/codex/                 codex app-server / exec 連携
-internal/quota/                 quota・観測値の補完・回復判定
-internal/state/                 state file の読み書き・migration
+internal/quota/                 quota・更新判定
+internal/state/                 state file の読み書き
 ```
 
-`cmd/codex-reset-anchor/main.go` は entry point です。`internal/app/app.go` は設定の読み込み、終了シグナルの設定、依存の組み立てだけを担当します。`internal/monitor/` は監視ループ（`monitor.go`）、状態保存とアンカー実行（`processor.go`）、ログ整形（`log.go`）を分離しています。欠落値の補完と回復した枠の判定は `internal/quota/observation.go` に置き、ファイルやログに依存しない処理として扱います。
+`app` が設定と起動、`monitor` が監視・アンカー実行・ログ出力、`quota` が取得値の比較、`state` が保存、`codex` が CLI との通信を担当します。
 
 ## state file
 
-現行 state schema は version 3 です。
+5h と weekly の前回取得値を保存します。
 
 ```json
 {
-  "version": 3,
   "fiveHour": {
     "limitId": "codex",
     "windowName": "primary",
     "usedPercent": 50,
     "windowDurationMins": 300,
-    "resetsAt": 1787775687,
-    "checkedAt": 0
+    "resetsAt": 1787775687
   },
   "weekly": {
     "limitId": "codex",
     "windowName": "secondary",
     "usedPercent": 71,
     "windowDurationMins": 10080,
-    "resetsAt": 1788271937,
-    "checkedAt": 0
+    "resetsAt": 1788271937
   }
 }
 ```
 
-`windowName` は観測情報として保存しますが、window の同一性判定には使いません。そのため Codex 側で 5 時間枠と週次枠の `primary` / `secondary` 配置が変わっても、同じ duration の枠として追跡を継続します。`limitId` が片方の poll で欠落した場合も、同じ duration であれば既知の ID を保持します。
+`windowName` は取得元の位置です。利用枠は `limitId` と `windowDurationMins` で識別します。
 
 ## ライセンス
 

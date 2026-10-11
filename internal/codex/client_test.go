@@ -12,15 +12,14 @@ import (
 	"github.com/shinderuman/codex-reset-anchor/internal/quota"
 )
 
-func TestSelectQuotaSnapshotCurrentShape(t *testing.T) {
+func TestSelectQuotaSnapshot(t *testing.T) {
 	primary := &rateLimitWindow{UsedPercent: 50, WindowDurationMin: quota.FiveHourWindowMinutes, ResetsAt: 1000}
 	secondary := &rateLimitWindow{UsedPercent: 71, WindowDurationMin: quota.WeeklyWindowMinutes, ResetsAt: 2000}
-	bucket := rateLimitBucket{LimitID: "codex", Primary: primary, Secondary: secondary}
+	bucket := rateLimitBucket{Primary: primary, Secondary: secondary}
 
 	snapshot := selectQuotaSnapshot(rateLimitsResult{
-		RateLimits:          &bucket,
 		RateLimitsByLimitID: map[string]rateLimitBucket{"codex": bucket},
-	}, time.Unix(10, 0))
+	})
 
 	if snapshot.FiveHour == nil || snapshot.Weekly == nil {
 		t.Fatalf("5h/weeklyを選択できなかった: %+v", snapshot)
@@ -32,17 +31,72 @@ func TestSelectQuotaSnapshotCurrentShape(t *testing.T) {
 
 func TestSelectQuotaSnapshotDoesNotDependOnPlacement(t *testing.T) {
 	bucket := rateLimitBucket{
-		LimitID:   "codex",
 		Primary:   &rateLimitWindow{WindowDurationMin: quota.WeeklyWindowMinutes},
 		Secondary: &rateLimitWindow{WindowDurationMin: quota.FiveHourWindowMinutes},
 	}
 
-	snapshot := selectQuotaSnapshot(rateLimitsResult{RateLimits: &bucket}, time.Now())
+	snapshot := selectQuotaSnapshot(rateLimitsResult{RateLimitsByLimitID: map[string]rateLimitBucket{"codex": bucket}})
 	if snapshot.FiveHour == nil || snapshot.FiveHour.WindowName != "secondary" {
 		t.Fatalf("5h選択が不正: %+v", snapshot.FiveHour)
 	}
 	if snapshot.Weekly == nil || snapshot.Weekly.WindowName != "primary" {
 		t.Fatalf("weekly選択が不正: %+v", snapshot.Weekly)
+	}
+}
+
+func TestSelectQuotaSnapshotDoesNotUseOtherBuckets(t *testing.T) {
+	snapshot := selectQuotaSnapshot(rateLimitsResult{
+		RateLimitsByLimitID: map[string]rateLimitBucket{
+			"other": {Primary: &rateLimitWindow{WindowDurationMin: quota.FiveHourWindowMinutes}},
+		},
+	})
+	if snapshot.FiveHour != nil || snapshot.Weekly != nil {
+		t.Fatalf("別の利用枠を代用した: %+v", snapshot)
+	}
+}
+
+func TestReadQuotas(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		response string
+		wantErr  string
+	}{
+		{
+			name:     "current response",
+			response: `{"id":2,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":20,"windowDurationMins":300,"resetsAt":1000},"secondary":{"usedPercent":74,"windowDurationMins":10080,"resetsAt":2000}}}}}`,
+		},
+		{name: "malformed response fails", response: "invalid json", wantErr: "app-serverのJSON解析に失敗しました"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			scriptPath := filepath.Join(t.TempDir(), "codex")
+			script := `#!/bin/sh
+IFS= read -r initialize
+printf '{"id":1,"result":{}}\n'
+IFS= read -r initialized
+IFS= read -r request
+printf '%s\n' "$CODEX_TEST_LIMIT_RESPONSE"
+while IFS= read -r request; do :; done
+`
+			if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CODEX_TEST_LIMIT_RESPONSE", tt.response)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			snapshot, err := New(scriptPath).ReadQuotas(ctx)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("unexpected read error: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snapshot.FiveHour == nil || snapshot.Weekly == nil || snapshot.FiveHour.UsedPercent != 20 || snapshot.Weekly.UsedPercent != 74 {
+				t.Fatalf("unexpected quotas: %+v", snapshot)
+			}
+		})
 	}
 }
 
@@ -63,7 +117,7 @@ printf 'discarded stderr\n' >&2
 	t.Setenv("CODEX_TEST_ARGUMENTS", argumentsPath)
 	t.Setenv("CODEX_TEST_WORKING_DIRECTORY", workingDirectoryPath)
 
-	client := New(scriptPath, "test")
+	client := New(scriptPath)
 	workDirectory := filepath.Join(dir, "state")
 	if err := client.RunAnchor(context.Background(), workDirectory, "Reply only: OK", "test-model", 2*time.Second); err != nil {
 		t.Fatalf("anchorに失敗した: %v", err)
@@ -115,7 +169,7 @@ printf '%s\n' "$@" > "$CODEX_TEST_ARGUMENTS"
 	}
 	t.Setenv("CODEX_TEST_ARGUMENTS", argumentsPath)
 
-	if err := New(scriptPath, "test").RunAnchor(context.Background(), dir, "Reply only: OK", "", 2*time.Second); err != nil {
+	if err := New(scriptPath).RunAnchor(context.Background(), dir, "Reply only: OK", "", 2*time.Second); err != nil {
 		t.Fatalf("anchorに失敗した: %v", err)
 	}
 	argumentsData, err := os.ReadFile(argumentsPath)
@@ -141,7 +195,7 @@ func TestRunAnchorReturnsStderrOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := New(scriptPath, "test").RunAnchor(context.Background(), dir, "Reply only: OK", "", 2*time.Second)
+	err := New(scriptPath).RunAnchor(context.Background(), dir, "Reply only: OK", "", 2*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "anchor failed") || !strings.Contains(err.Error(), "exit status 2") {
 		t.Fatalf("失敗内容が不正: %v", err)
 	}
@@ -155,7 +209,7 @@ func TestRunAnchorTimesOut(t *testing.T) {
 	}
 
 	started := time.Now()
-	err := New(scriptPath, "test").RunAnchor(context.Background(), dir, "Reply only: OK", "", 100*time.Millisecond)
+	err := New(scriptPath).RunAnchor(context.Background(), dir, "Reply only: OK", "", 100*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "タイムアウト") {
 		t.Fatalf("timeoutエラーにならなかった: %v", err)
 	}

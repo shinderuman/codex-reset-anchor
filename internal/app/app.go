@@ -12,8 +12,6 @@ import (
 	"github.com/shinderuman/codex-reset-anchor/internal/monitor"
 )
 
-const Version = "0.4.0"
-
 func Run() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -26,6 +24,6 @@ func Run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	client := codex.New(cfg.codexPath, Version)
+	client := codex.New(cfg.codexPath)
 	return monitor.New(cfg.monitorConfig, client, client, log.Default()).Run(ctx)
 }
