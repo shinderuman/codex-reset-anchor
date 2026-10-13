@@ -10,7 +10,7 @@ func TestParseConfigDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("default configを解析できなかった: %v", err)
 	}
-	if cfg.monitorConfig.PollEvery != 5*time.Minute || cfg.monitorConfig.Prompt != "Reply only: OK" || cfg.codexPath != "codex" {
+	if cfg.monitorConfig.PollEvery != 1*time.Minute || cfg.monitorConfig.Prompt != "Reply only: OK" || cfg.codexPath != "codex" {
 		t.Fatalf("default configが不正: %+v", cfg)
 	}
 	if cfg.monitorConfig.StatePath != "/tmp/home/.local/var/codex-reset-anchor/state.json" {
